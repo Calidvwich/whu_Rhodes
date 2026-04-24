@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+examples/verify_samples/
+examples/verify_vectors/
+examples/verify_vectors_local/
+examples/batch_vectors/
+examples/*_vector.json

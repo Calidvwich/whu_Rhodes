@@ -1,0 +1,25 @@
+{
+  "samples": [
+    {
+      "person_id": "alice",
+      "name": "Alice",
+      "image_path": "local_faces/alice_01.jpg",
+      "image_source": "local_faces/alice_01.jpg",
+      "l2_normalized": true
+    },
+    {
+      "person_id": "alice",
+      "name": "Alice",
+      "image_path": "local_faces/alice_02.jpg",
+      "image_source": "local_faces/alice_02.jpg",
+      "l2_normalized": true
+    },
+    {
+      "person_id": "bob",
+      "name": "Bob",
+      "image_path": "local_faces/bob_01.jpg",
+      "image_source": "local_faces/bob_01.jpg",
+      "l2_normalized": true
+    }
+  ]
+}
