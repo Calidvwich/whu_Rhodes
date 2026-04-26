@@ -22,12 +22,39 @@ pip install -r face_engine/requirements.txt
 - FaceNet / MTCNN 代码来自仓库内的 `facenet_pytorch` git submodule
 - 不再单独安装 `facenet-pytorch` pip 包
 
-## 2. 输入输出契约
+## 2. 预处理模块
+
+仓库现在提供原始图片预处理 CLI，用于给 `face_engine` 生成稳定输入：
+
+单图预处理：
+
+```bash
+python face_engine/scripts/preprocess_face.py single \
+  --image path/to/raw_photo.jpg \
+  --out-image face_engine/examples/aligned_face.png
+```
+
+批量预处理：
+
+```bash
+python face_engine/scripts/preprocess_face.py batch \
+  --input-dir path/to/raw_images \
+  --out-dir face_engine/examples/aligned_faces
+```
+
+说明：
+- 使用仓库内 `facenet_pytorch` submodule 的 `MTCNN`
+- 检测到多张人脸时，默认选择面积最大的那一张
+- 基于 5 点关键点做相似变换对齐，不是仅按框裁剪
+- 输出固定为 `RGB` 对齐人脸图，默认尺寸 `160x160`
+- 如果检测失败，脚本会直接报错并给出失败图片路径
+
+## 3. 输入输出契约
 
 - 输入：`RGB` 对齐后人脸图，推荐尺寸 `160x160`
 - 输出：JSON 文件，格式为 `{"vector":[512个float]}`
 
-## 3. 命令行使用
+## 4. 命令行使用
 
 单图提取：
 
@@ -67,11 +94,17 @@ python face_engine/scripts/verify_extractor.py \
   --out-dir face_engine/examples/verify_vectors_local
 ```
 
-## 4. Python 调用方式
+## 5. Python 调用方式
 
 ```python
-from face_engine import extract_from_aligned_face, save_vector_json
+from face_engine import (
+    extract_from_aligned_face,
+    preprocess_face_image,
+    save_vector_json,
+)
 
-vec = extract_from_aligned_face("aligned_face.jpg", l2_normalize_output=True)
+aligned = preprocess_face_image("raw_photo.jpg")
+aligned.save("aligned_face.png")
+vec = extract_from_aligned_face("aligned_face.png", l2_normalize_output=True)
 save_vector_json(vec, "aligned_face.vector.json")
 ```

@@ -8,10 +8,10 @@ from pathlib import Path
 import numpy as np
 import requests
 import torch
-from PIL import Image
 
+from .face_preprocessor import preprocess_face, save_preprocessed_face
 from .facenet_extractor import extract_from_aligned_face, save_vector_json
-from .facenet_submodule import MTCNN, REPO_ROOT
+from .facenet_submodule import REPO_ROOT
 
 DEFAULT_SAMPLES = [
     {
@@ -135,21 +135,6 @@ def _resolve_device(device: str) -> str:
     return device
 
 
-def _align_face_to_160(mtcnn: MTCNN, src_path: Path, aligned_path: Path) -> None:
-    img = Image.open(src_path).convert("RGB")
-    face = mtcnn(img)
-    if face is None:
-        raise RuntimeError(f"no face detected in image: {src_path}")
-    if face.ndim == 4:
-        face = face[0]
-    arr = face.permute(1, 2, 0).detach().cpu().numpy()
-    if arr.max() <= 1.5:
-        arr = arr * 255.0
-    arr = np.clip(arr, 0, 255).astype(np.uint8)
-    aligned_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr, mode="RGB").save(aligned_path)
-
-
 def cmd_verify(args: argparse.Namespace) -> None:
     if not args.download_samples and not args.manifest:
         raise SystemExit("please provide at least one source: --download-samples or --manifest")
@@ -167,23 +152,19 @@ def cmd_verify(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     vectors: dict[str, np.ndarray] = {}
     resolved_device = _resolve_device(args.device)
-    mtcnn = None
-    if args.auto_align:
-        mtcnn = MTCNN(
-            image_size=160,
-            margin=0,
-            post_process=False,
-            select_largest=True,
-            device=resolved_device,
-        )
 
     vector_items: list[dict] = []
     for sample in samples:
         source_image_path = Path(sample.image_path)
         image_path = source_image_path
-        if mtcnn is not None:
+        if args.auto_align:
             aligned_path = out_dir / "aligned_faces" / f"{source_image_path.stem}_aligned.png"
-            _align_face_to_160(mtcnn, source_image_path, aligned_path)
+            result = preprocess_face(
+                source_image_path,
+                device=resolved_device,
+                output_size=160,
+            )
+            save_preprocessed_face(result.image, aligned_path)
             image_path = aligned_path
 
         vector = extract_from_aligned_face(

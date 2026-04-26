@@ -38,9 +38,10 @@ git submodule update --remote
 
 - 使用仓库内 `facenet_pytorch` submodule 提供的 FaceNet / MTCNN
 - 提供 Python 接口与 CLI：
+  - `python face_engine/scripts/preprocess_face.py single ...`
   - `python face_engine/scripts/extract_feature.py single ...`
   - `python face_engine/scripts/verify_extractor.py --download-samples`
-- 详细说明见 [face_engine/README.md](/home/orangeisland66/桌面/whu_Rhodes/face_engine/README.md)
+- 详细说明见 [face_engine/README.md](face_engine/README.md)
 
 ### `database/`
 
@@ -48,26 +49,31 @@ git submodule update --remote
 - 通过 JSON 向量和算法层联调：
   - `python database/scripts/feature_from_json.py enroll ...`
   - `python database/scripts/feature_from_json.py recognize ...`
-- 详细说明见 [database/README.md](/home/orangeisland66/桌面/whu_Rhodes/database/README.md)
+- 详细说明见 [database/README.md](database/README.md)
 
 ## 最小联调流程
 
 ```bash
-# 1) 提取 512 维向量
+# 1) 预处理原始人脸图
+python face_engine/scripts/preprocess_face.py single \
+  --image path/to/raw_face.jpg \
+  --out-image face_engine/examples/aligned_face.png
+
+# 2) 提取 512 维向量
 python face_engine/scripts/extract_feature.py single \
-  --image path/to/aligned_face.jpg \
+  --image face_engine/examples/aligned_face.png \
   --out-json database/examples/face_a.json
 
-# 2) 初始化数据库
+# 3) 初始化数据库
 python database/scripts/init_db.py
 
-# 3) 录入向量
+# 4) 录入向量
 python database/scripts/feature_from_json.py enroll \
   --username alice \
   --vector-json database/examples/face_a.json \
-  --image-path path/to/aligned_face.jpg
+  --image-path face_engine/examples/aligned_face.png
 
-# 4) 用向量识别
+# 5) 用向量识别
 python database/scripts/feature_from_json.py recognize \
   --vector-json database/examples/face_a.json \
   --device-info demo_camera
