@@ -4,6 +4,42 @@ import os
 import hashlib
 import importlib
 from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATABASE_ROOT = PROJECT_ROOT / "database"
+if DATABASE_ROOT.as_posix() not in sys.path:
+    sys.path.insert(0, DATABASE_ROOT.as_posix())
+
+from src.db.connection import DbConfig, connect
+from src.db.dao import (
+    delete_user_by_username,
+    get_config_by_key,
+    get_user_by_id,
+    get_user_by_username,
+    init_schema,
+    insert_face_feature,
+    insert_recognition_log,
+    insert_user,
+    iter_all_active_features,
+    update_config,
+    update_user_info,
+    update_user_status,
+)
+from src.feature.matcher import match_best
+
+
+def get_db_conn():
+    db_path = DATABASE_ROOT / "data" / "app.sqlite3"
+    schema_path = DATABASE_ROOT / "src" / "db" / "schema.sql"
+    conn = connect(DbConfig(path=db_path))
+    schema_sql = schema_path.read_text(encoding="utf-8")
+    init_schema(conn, schema_sql)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(user)")}
+    if "photo" not in columns:
+        conn.execute("ALTER TABLE user ADD COLUMN photo TEXT")
+        conn.commit()
+    return conn
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
@@ -16,6 +52,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -37,61 +74,67 @@ bcrypt_mod = _optional_import("bcrypt")
 
 
 # ========= 全局样式 =========
-QSS = """
-QMainWindow, QWidget {
-    background-color: #f5f7fb;
-    font-family: "Microsoft YaHei";
-    font-size: 14px;
-}
-#titleLabel {
-    font-size: 28px;
-    font-weight: 700;
-    color: #1f2d3d;
-}
-#card {
-    background: white;
-    border: 1px solid #e6ebf2;
-    border-radius: 14px;
-}
-#subtitle {
-    font-size: 20px;
-    font-weight: 600;
-    color: #2c3e50;
-}
-QLineEdit {
-    height: 38px;
-    border: 1px solid #d7deea;
-    border-radius: 8px;
-    padding: 0 10px;
-    background: #fcfdff;
-}
-QLineEdit:focus {
-    border: 1px solid #4c8bf5;
-}
-QPushButton {
-    height: 38px;
-    border: none;
-    border-radius: 8px;
-    padding: 0 16px;
-    background-color: #4c8bf5;
-    color: white;
-    font-weight: 600;
-}
-QPushButton:hover {
-    background-color: #3f7ee8;
-}
-QPushButton:pressed {
-    background-color: #326fdf;
-}
-#panelTitle {
-    font-size: 16px;
-    font-weight: 600;
-    color: #2c3e50;
-}
-#placeholder {
-    color: #7f8c9f;
-}
-"""
+def get_qss(scale=1.0):
+    def s(val): return int(val * scale)
+    return f"""
+    QMainWindow, QWidget {{
+        background-color: #f5f7fb;
+        font-family: "Microsoft YaHei";
+        font-size: {s(15)}px;
+    }}
+    #titleLabel {{
+        font-size: {s(32)}px;
+        font-weight: 700;
+        color: #1f2d3d;
+    }}
+    #card {{
+        background: white;
+        border: 1px solid #e6ebf2;
+        border-radius: {s(16)}px;
+    }}
+    #subtitle {{
+        font-size: {s(22)}px;
+        font-weight: 600;
+        color: #2c3e50;
+        margin-bottom: {s(10)}px;
+    }}
+    QLineEdit {{
+        min-height: {s(44)}px;
+        border: 1px solid #d7deea;
+        border-radius: {s(8)}px;
+        padding: 0 {s(14)}px;
+        background: #fcfdff;
+        font-size: {s(15)}px;
+    }}
+    QLineEdit:focus {{
+        border: 1px solid #4c8bf5;
+    }}
+    QPushButton {{
+        min-height: {s(44)}px;
+        border: none;
+        border-radius: {s(8)}px;
+        padding: 0 {s(24)}px;
+        background-color: #4c8bf5;
+        color: white;
+        font-size: {s(16)}px;
+        font-weight: 600;
+    }}
+    QPushButton:hover {{
+        background-color: #3f7ee8;
+    }}
+    QPushButton:pressed {{
+        background-color: #326fdf;
+    }}
+    #panelTitle {{
+        font-size: {s(16)}px;
+        font-weight: 600;
+        color: #2c3e50;
+    }}
+    #placeholder {{
+        color: #7f8c9f;
+    }}
+    """
+
 
 
 def build_response(code, success, message, data=None):
@@ -104,321 +147,18 @@ def build_response(code, success, message, data=None):
     }
 
 
-# ========= 数据持久层 =========
-class UserRepository:
-    def __init__(self):
-        self._users = {}
-        self._user_id_seq = 1000
-
-    def getUserByUsername(self, username):
-        return self._users.get(username)
-
-    def getUserById(self, user_id):
-        for item in self._users.values():
-            if item["user_id"] == user_id:
-                return item
-        return None
-
-    def hasDuplicateAccount(self, username, phone, email):
-        if username in self._users:
-            return True
-        for user in self._users.values():
-            if phone and user.get("phone") == phone:
-                return True
-            if email and user.get("email") == email:
-                return True
-        return False
-
-    def insertUser(self, username, password_hash, phone, email, role="user"):
-        self._user_id_seq += 1
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        record = {
-            "user_id": self._user_id_seq,
-            "username": username,
-            "password": password_hash,
-            "phone": phone,
-            "email": email,
-            "create_time": now_str,
-            "status": "enabled",
-            "role": role,
-            "photo": "",
-        }
-        self._users[username] = record
-        return record
-
-    def updateUserStatus(self, user_id, status):
-        user = self.getUserById(user_id)
-        if not user:
-            return False
-        user["status"] = status
-        return True
-
-    def updateUserInfo(self, old_username, new_username, password_hash=None, photo=None):
-        old = self._users.get(old_username)
-        if not old:
-            return False, "原用户名不存在"
-        if new_username != old_username and new_username in self._users:
-            return False, "新用户名已存在"
-
-        self._users.pop(old_username)
-        old["username"] = new_username
-        if password_hash:
-            old["password"] = password_hash
-        if photo is not None:
-            old["photo"] = photo
-        self._users[new_username] = old
-        return True, "用户信息修改成功"
-
-    def deleteUser(self, username):
-        if username not in self._users:
-            return False
-        self._users.pop(username)
-        return True
-
-
-class FaceFeatureRepository:
-    def __init__(self):
-        self._features = []
-        self._feature_id_seq = 0
-
-    def insertFaceFeature(self, user_id, feature_vector, image_path):
-        self._feature_id_seq += 1
-        if np is not None:
-            vec = np.asarray(feature_vector, dtype=np.float32)
-        else:
-            vec = [float(x) for x in feature_vector]
-        item = {
-            "feature_id": self._feature_id_seq,
-            "user_id": user_id,
-            "feature_vector": vec,
-            "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "is_active": True,
-            "image_path": image_path,
-        }
-        self._features.append(item)
-        return item
-
-    def getFaceFeaturesByUserId(self, user_id):
-        return [f for f in self._features if f["user_id"] == user_id and f["is_active"]]
-
-    def getAllActiveFeatures(self):
-        return [f for f in self._features if f["is_active"]]
-
-
-class RecognitionLogRepository:
-    def __init__(self):
-        self._logs = []
-        self._log_id_seq = 0
-
-    def insertRecognitionLog(self, user_id, capture_image, similarity, result, recognize_time, device_info):
-        self._log_id_seq += 1
-        row = {
-            "log_id": self._log_id_seq,
-            "user_id": user_id,
-            "capture_image": capture_image,
-            "similarity": float(similarity),
-            "result": result,
-            "recognize_time": recognize_time,
-            "device_info": device_info,
-        }
-        self._logs.append(row)
-        return row
-
-    def getRecognitionLogsByUserId(self, user_id):
-        return [x for x in self._logs if x["user_id"] == user_id]
-
-    def getRecognitionLogsByTimeRange(self, start_time, end_time):
-        result = []
-        for row in self._logs:
-            t = datetime.strptime(row["recognize_time"], "%Y-%m-%d %H:%M:%S")
-            if start_time <= t <= end_time:
-                result.append(row)
-        return result
-
-
-class SystemConfigRepository:
-    def __init__(self):
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._configs = {
-            "recognition_threshold": {
-                "config_id": 1,
-                "config_key": "recognition_threshold",
-                "config_value": "0.82",
-                "update_time": now_str,
-                "description": "识别阈值",
-            },
-            "model_version": {
-                "config_id": 2,
-                "config_key": "model_version",
-                "config_value": "demo-v1",
-                "update_time": now_str,
-                "description": "模型版本",
-            },
-            "oss_path": {
-                "config_id": 3,
-                "config_key": "oss_path",
-                "config_value": "local://face_data",
-                "update_time": now_str,
-                "description": "对象存储路径",
-            },
-        }
-
-    def getConfigByKey(self, config_key):
-        return self._configs.get(config_key)
-
-    def updateConfig(self, config_key, config_value):
-        if config_key not in self._configs:
-            return False
-        self._configs[config_key]["config_value"] = str(config_value)
-        self._configs[config_key]["update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return True
-
-
-# ========= 算法支撑层 =========
-class FaceAlgorithm:
-    def __init__(self):
-        self.detector = None
-        if cv2 is not None:
-            cascade_name = "haarcascade_frontalface_default.xml"
-            candidate_paths = []
-
-            cv2_data = getattr(cv2, "data", None)
-            if cv2_data is not None:
-                haar_dir = getattr(cv2_data, "haarcascades", None)
-                if haar_dir:
-                    candidate_paths.append(os.path.join(haar_dir, cascade_name))
-
-            cv2_file = getattr(cv2, "__file__", "")
-            if cv2_file:
-                cv2_dir = os.path.dirname(cv2_file)
-                candidate_paths.extend([
-                    os.path.join(cv2_dir, "data", cascade_name),
-                    os.path.join(cv2_dir, "..", "share", "opencv4", "haarcascades", cascade_name),
-                    os.path.join(cv2_dir, "..", "etc", "haarcascades", cascade_name),
-                ])
-
-            for path in candidate_paths:
-                normalized_path = os.path.normpath(path)
-                if not os.path.exists(normalized_path):
-                    continue
-                detector = cv2.CascadeClassifier(normalized_path)
-                if detector is not None and not detector.empty():
-                    self.detector = detector
-                    break
-
-    def detectFace(self, image_data):
-        if image_data is None:
-            return build_response(4100, False, "图像为空", {"face_found": False, "face_region": []})
-
-        if cv2 is None:
-            return build_response(4102, False, "未安装 OpenCV，无法执行人脸检测", {
-                "face_found": False,
-                "face_region": [],
-            })
-
-        if self.detector is None or self.detector.empty():
-            return build_response(4103, False, "OpenCV 已安装，但未找到可用的人脸检测模型", {
-                "face_found": False,
-                "face_region": [],
-            })
-
-        gray = cv2.cvtColor(image_data, cv2.COLOR_BGR2GRAY)
-        faces = self.detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
-        face_region = [[int(x), int(y), int(w), int(h)] for x, y, w, h in faces]
-        found = len(face_region) > 0
-        message = "检测到人脸" if found else "未检测到人脸"
-        return build_response(0 if found else 4101, found, message, {
-            "face_found": found,
-            "face_region": face_region,
-        })
-
-    def extractFeature(self, face_image):
-        if face_image is None or getattr(face_image, "size", 0) == 0:
-            return build_response(4200, False, "无效的人脸区域", {
-                "feature_vector": [],
-            })
-
-        if cv2 is None or np is None:
-            raw = b""
-            try:
-                raw = face_image.tobytes()
-            except Exception:
-                raw = b""
-            if not raw:
-                raw = hashlib.sha256(str(face_image).encode("utf-8")).digest()
-            repeated = (raw * ((512 // len(raw)) + 1))[:512]
-            feature_vector = [b / 255.0 for b in repeated]
-            return build_response(0, True, "特征提取成功（简化模式）", {
-                "feature_vector": feature_vector,
-                "vector_dim": 512,
-            })
-
-        gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
-        normalized = resized.astype(np.float32).flatten() / 255.0
-
-        if normalized.size >= 512:
-            feature_vector = normalized[:512]
-        else:
-            repeat_count = int(np.ceil(512 / normalized.size))
-            feature_vector = np.tile(normalized, repeat_count)[:512]
-
-        return build_response(0, True, "特征提取成功", {
-            "feature_vector": feature_vector,
-            "vector_dim": 512,
-        })
-
-    def compareFeature(self, input_vector, feature_library, threshold):
-        if input_vector is None or len(input_vector) == 0:
-            return build_response(4300, False, "输入特征为空", {
-                "matched_user_id": None,
-                "max_similarity": 0.0,
-                "matched": False,
-            })
-
-        if not feature_library:
-            return build_response(4301, True, "特征库为空，判定为陌生人", {
-                "matched_user_id": None,
-                "max_similarity": 0.0,
-                "matched": False,
-            })
-
-        input_vec = [float(x) for x in input_vector]
-        input_norm = math.sqrt(sum(x * x for x in input_vec))
-        best_score = -1.0
-        best_user_id = None
-
-        for feature in feature_library:
-            vec = [float(x) for x in feature["feature_vector"]]
-            vec_norm = math.sqrt(sum(x * x for x in vec))
-            denom = input_norm * vec_norm
-            if denom == 0:
-                continue
-            sim = float(sum(a * b for a, b in zip(input_vec, vec)) / denom)
-            if sim > best_score:
-                best_score = sim
-                best_user_id = feature["user_id"]
-
-        if best_score < 0:
-            best_score = 0.0
-        matched = best_score >= float(threshold)
-
-        return build_response(0, True, "比对完成", {
-            "matched_user_id": best_user_id if matched else None,
-            "max_similarity": best_score,
-            "matched": matched,
-        })
-
-
 # ========= 业务逻辑层 =========
 class FaceBusinessService:
     def __init__(self):
-        self.user_repo = UserRepository()
-        self.face_repo = FaceFeatureRepository()
-        self.log_repo = RecognitionLogRepository()
-        self.config_repo = SystemConfigRepository()
+        self.conn = get_db_conn()
         self.algorithm = FaceAlgorithm()
         self._seed_demo_users()
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def _hash_password(self, password):
         if bcrypt_mod:
@@ -433,17 +173,45 @@ class FaceBusinessService:
             return bcrypt_mod.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
         return False
 
+    @staticmethod
+    def _row_to_user_dict(row):
+        return {
+            "user_id": row.user_id,
+            "username": row.username,
+            "password": row.password,
+            "phone": row.phone,
+            "email": row.email,
+            "status": row.status,
+            "role": row.role,
+        }
+
+    def _username_exists(self, username):
+        return get_user_by_username(self.conn, username) is not None
+
+    def _phone_or_email_exists(self, phone, email):
+        if phone:
+            phone_row = self.conn.execute("SELECT 1 FROM user WHERE phone = ?", (phone,)).fetchone()
+            if phone_row is not None:
+                return True
+        if email:
+            email_row = self.conn.execute("SELECT 1 FROM user WHERE email = ?", (email,)).fetchone()
+            if email_row is not None:
+                return True
+        return False
+
     def _seed_demo_users(self):
-        if self.user_repo.getUserByUsername("admin"):
+        if self._username_exists("admin"):
             return
-        self.user_repo.insertUser(
+        insert_user(
+            self.conn,
             username="admin",
             password_hash=self._hash_password("admin123"),
             phone="13800000000",
             email="admin@example.com",
             role="admin",
         )
-        self.user_repo.insertUser(
+        insert_user(
+            self.conn,
             username="user1",
             password_hash=self._hash_password("123456"),
             phone="13900000000",
@@ -452,54 +220,54 @@ class FaceBusinessService:
         )
 
     def getUserByUsername(self, username):
-        user = self.user_repo.getUserByUsername(username)
+        user = get_user_by_username(self.conn, username)
         if not user:
             return build_response(4040, False, "用户不存在", {})
-        return build_response(0, True, "查询成功", {"user": user})
+        return build_response(0, True, "查询成功", {"user": self._row_to_user_dict(user)})
 
     def login(self, username, password):
-        user = self.user_repo.getUserByUsername(username)
+        user = get_user_by_username(self.conn, username)
         if not user:
             return build_response(4011, False, "用户未注册", {
                 "user_id": None,
                 "role": None,
             })
 
-        if user["status"] != "enabled":
+        if int(user.status) != 1:
             return build_response(4013, False, "账号被禁用", {
-                "user_id": user["user_id"],
-                "role": user["role"],
+                "user_id": user.user_id,
+                "role": user.role,
             })
 
-        if not self._verify_password(password, user["password"]):
+        if not self._verify_password(password, user.password):
             return build_response(4012, False, "密码错误", {
-                "user_id": user["user_id"],
-                "role": user["role"],
+                "user_id": user.user_id,
+                "role": user.role,
             })
 
         return build_response(0, True, "登录成功", {
-            "user_id": user["user_id"],
-            "role": user["role"],
-            "username": user["username"],
+            "user_id": user.user_id,
+            "role": user.role,
+            "username": user.username,
         })
 
     def register(self, username, password, phone, email):
         if not username or not password:
             return build_response(4020, False, "用户名和密码不能为空", {"user_id": None})
 
-        if self.user_repo.hasDuplicateAccount(username, phone, email):
+        if self._username_exists(username) or self._phone_or_email_exists(phone, email):
             return build_response(4021, False, "账号已存在", {"user_id": None})
 
         password_hash = self._hash_password(password)
-        user = self.user_repo.insertUser(username, password_hash, phone, email, role="user")
-        return build_response(0, True, "注册成功", {"user_id": user["user_id"]})
+        user_id = insert_user(self.conn, username=username, password_hash=password_hash, phone=phone, email=email, role="user")
+        return build_response(0, True, "注册成功", {"user_id": user_id})
 
     def addFaceFeature(self, user_id, image_file, operator_id):
-        operator = self.user_repo.getUserById(operator_id)
-        if not operator or operator["role"] != "admin" or operator["status"] != "enabled":
+        operator = get_user_by_id(self.conn, operator_id)
+        if not operator or operator.role != "admin" or int(operator.status) != 1:
             return build_response(4031, False, "管理员权限不足", {"feature_id": None})
 
-        user = self.user_repo.getUserById(user_id)
+        user = get_user_by_id(self.conn, user_id)
         if not user:
             return build_response(4032, False, "目标用户不存在", {"feature_id": None})
 
@@ -507,23 +275,27 @@ class FaceBusinessService:
         if image is None:
             return build_response(4033, False, "图像格式不合法或路径无效", {"feature_id": None})
 
-        detect_resp = self.algorithm.detectFace(image)
+        detect_resp = self.algorithm.detect_face(image)
         if not detect_resp["success"]:
             return build_response(4034, False, "未检测到有效人脸", {"feature_id": None})
 
         x, y, w, h = detect_resp["data"]["face_region"][0]
         face_image = image[y:y + h, x:x + w]
-        extract_resp = self.algorithm.extractFeature(face_image)
+        extract_resp = self.algorithm.extract_feature(face_image)
         if not extract_resp["success"]:
             return build_response(4035, False, "特征提取失败", {"feature_id": None})
 
         image_path = image_file if isinstance(image_file, str) else "memory_frame"
-        row = self.face_repo.insertFaceFeature(
-            user_id=user_id,
-            feature_vector=extract_resp["data"]["feature_vector"],
+        if np is None:
+            return build_response(5004, False, "未安装 NumPy，无法录入特征", {"feature_id": None})
+
+        feature_id = insert_face_feature(
+            self.conn,
+            user_id=int(user_id),
+            feature_vector=np.asarray(extract_resp["data"]["feature_vector"], dtype=np.float32),
             image_path=image_path,
         )
-        return build_response(0, True, "录入成功", {"feature_id": row["feature_id"]})
+        return build_response(0, True, "录入成功", {"feature_id": feature_id})
 
     def recognizeFace(self, image_data, device_info, request_time):
         if image_data is None:
@@ -534,14 +306,14 @@ class FaceBusinessService:
                 "result": "识别失败",
             })
 
-        detect_resp = self.algorithm.detectFace(image_data)
+        detect_resp = self.algorithm.detect_face(image_data)
         if not detect_resp["success"]:
-            self.log_repo.insertRecognitionLog(
+            insert_recognition_log(
+                self.conn,
                 user_id=None,
-                capture_image="memory_frame",
+                input_image_url="memory_frame",
                 similarity=0.0,
-                result="未检测到人脸",
-                recognize_time=request_time,
+                result=0,
                 device_info=device_info,
             )
             return build_response(4042, False, "未检测到人脸", {
@@ -553,14 +325,14 @@ class FaceBusinessService:
 
         x, y, w, h = detect_resp["data"]["face_region"][0]
         face = image_data[y:y + h, x:x + w]
-        extract_resp = self.algorithm.extractFeature(face)
+        extract_resp = self.algorithm.extract_feature(face)
         if not extract_resp["success"]:
-            self.log_repo.insertRecognitionLog(
+            insert_recognition_log(
+                self.conn,
                 user_id=None,
-                capture_image="memory_frame",
+                input_image_url="memory_frame",
                 similarity=0.0,
-                result="特征提取失败",
-                recognize_time=request_time,
+                result=0,
                 device_info=device_info,
             )
             return build_response(4043, False, "特征提取失败", {
@@ -570,31 +342,28 @@ class FaceBusinessService:
                 "result": "识别失败",
             })
 
-        threshold_row = self.config_repo.getConfigByKey("recognition_threshold")
-        threshold = float(threshold_row["config_value"]) if threshold_row else 0.82
-        compare_resp = self.algorithm.compareFeature(
-            extract_resp["data"]["feature_vector"],
-            self.face_repo.getAllActiveFeatures(),
-            threshold,
-        )
+        threshold = float(get_config_by_key(self.conn, "threshold") or get_config_by_key(self.conn, "recognition_threshold") or "0.80")
+        feature_vector = np.asarray(extract_resp["data"]["feature_vector"], dtype=np.float32) if np is not None else extract_resp["data"]["feature_vector"]
+        library = list(iter_all_active_features(self.conn))
+        compare_resp = match_best(feature_vector, library, threshold=threshold)
 
-        matched = compare_resp["data"]["matched"]
-        matched_user_id = compare_resp["data"]["matched_user_id"]
-        similarity = float(compare_resp["data"]["max_similarity"])
+        matched = compare_resp.matched
+        matched_user_id = compare_resp.matched_user_id
+        similarity = float(compare_resp.max_similarity)
 
         username = None
         result = "陌生人"
         if matched and matched_user_id is not None:
-            user = self.user_repo.getUserById(matched_user_id)
-            username = user["username"] if user else None
+            user = get_user_by_id(self.conn, matched_user_id)
+            username = user.username if user else None
             result = "已识别"
 
-        self.log_repo.insertRecognitionLog(
+        log_id = insert_recognition_log(
+            self.conn,
             user_id=matched_user_id if matched else None,
-            capture_image="memory_frame",
+            input_image_url="memory_frame",
             similarity=similarity,
-            result=result,
-            recognize_time=request_time,
+            result=1 if matched else 0,
             device_info=device_info,
         )
 
@@ -603,34 +372,59 @@ class FaceBusinessService:
             "username": username,
             "similarity": similarity,
             "result": result,
+            "log_id": log_id,
         })
 
     def updateConfig(self, operator_id, config_key, config_value):
-        operator = self.user_repo.getUserById(operator_id)
-        if not operator or operator["role"] != "admin":
+        operator = get_user_by_id(self.conn, operator_id)
+        if not operator or operator.role != "admin":
             return build_response(4051, False, "仅管理员可修改配置", {})
-        ok = self.config_repo.updateConfig(config_key, config_value)
-        if not ok:
-            return build_response(4052, False, "配置键不存在", {})
+        update_config(self.conn, config_key, str(config_value))
         return build_response(0, True, "配置更新成功", {
             "config_key": config_key,
             "config_value": str(config_value),
         })
 
+    def updateUserStatus(self, operator_id, target_username, status):
+        operator = get_user_by_id(self.conn, operator_id)
+        if not operator or operator.role != "admin":
+            return build_response(4052, False, "仅管理员可修改用户状态", {})
+        
+        target_user = get_user_by_username(self.conn, target_username)
+        if not target_user:
+            return build_response(4053, False, "目标用户不存在", {})
+            
+        update_user_status(self.conn, user_id=target_user.user_id, status=status)
+        return build_response(0, True, "状态更新成功", {})
+
     def updateUser(self, old_username, new_username, new_password, new_photo):
+        if not old_username or not new_username:
+            return build_response(4060, False, "用户名不能为空", {})
+
+        old_user = get_user_by_username(self.conn, old_username)
+        if not old_user:
+            return build_response(4061, False, "原用户名不存在", {})
+
+        if new_username != old_username and get_user_by_username(self.conn, new_username):
+            return build_response(4061, False, "新用户名已存在", {})
+
         password_hash = self._hash_password(new_password) if new_password else None
-        ok, msg = self.user_repo.updateUserInfo(old_username, new_username, password_hash, new_photo)
-        if not ok:
-            return build_response(4061, False, msg, {})
-        return build_response(0, True, msg, {})
+        update_user_info(
+            self.conn,
+            user_id=old_user.user_id,
+            username=new_username,
+            password_hash=password_hash,
+            photo=new_photo or None,
+        )
+        return build_response(0, True, "用户信息修改成功", {})
 
     def deleteUser(self, username):
-        target = self.user_repo.getUserByUsername(username)
+        target = get_user_by_username(self.conn, username)
         if not target:
             return build_response(4062, False, "用户不存在", {})
-        if target["role"] == "admin":
+        if target.role == "admin":
             return build_response(4063, False, "管理员账号不可删除", {})
-        self.user_repo.deleteUser(username)
+        delete_user_by_username(self.conn, username)
         return build_response(0, True, "删除用户成功", {})
 
     @staticmethod
@@ -676,32 +470,48 @@ class FaceSystemUI(QMainWindow):
     def go(self, name):
         self.stack.setCurrentWidget(self.pages[name])
 
-    def wrap_center(self, inner_widget, max_width=460):
+    def wrap_center(self, inner_widget, base_width=460):
+        # 记录基础宽度以便 resizeEvent 等比缩放
+        inner_widget.setProperty("base_width", base_width)
+        
         root = QWidget()
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(30, 25, 30, 25)
+        outer.setContentsMargins(0, 0, 0, 0)
+        
+        # 内部容器，用于包装 title 和 card
+        container = QWidget()
+        container.setObjectName("container")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(40, 35, 40, 35)
 
         title = QLabel("人脸识别系统")
         title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignHCenter)
-        outer.addWidget(title)
-        outer.addSpacing(10)
-
-        row = QHBoxLayout()
-        row.addStretch()
+        container_layout.addWidget(title)
+        container_layout.addSpacing(20)
 
         card = QFrame()
         card.setObjectName("card")
-        card.setMaximumWidth(max_width)
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(26, 24, 26, 24)
+        card_layout.setContentsMargins(36, 32, 36, 32)
         card_layout.addWidget(inner_widget)
 
-        row.addWidget(card)
+        container_layout.addWidget(card)
+        
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(container)
         row.addStretch()
 
+        outer.addStretch()
         outer.addLayout(row)
         outer.addStretch()
+        
+        # 保存对需要缩放组件的引用
+        if not hasattr(self, "_scalable_cards"):
+            self._scalable_cards = []
+        self._scalable_cards.append(card)
+        
         return root
 
     def section_title(self, txt):
@@ -766,20 +576,10 @@ class FaceSystemUI(QMainWindow):
 
     def create_start_page(self):
         w = QWidget()
-        layout = QVBoxLayout(w)
-        layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(18)
-
-        title = QLabel("欢迎使用人脸识别系统")
-        title.setObjectName("titleLabel")
-        title.setAlignment(Qt.AlignCenter)
-
-        card = QFrame()
-        card.setObjectName("card")
-        card.setMaximumWidth(520)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(30, 28, 30, 28)
-        card_layout.setSpacing(20)
+        w.setProperty("base_width", 520)
+        card_layout = QVBoxLayout(w)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(24)
 
         btn_row = QHBoxLayout()
         btn_login = QPushButton("登录")
@@ -792,9 +592,7 @@ class FaceSystemUI(QMainWindow):
         card_layout.addWidget(self.section_title("请选择操作"))
         card_layout.addLayout(btn_row)
 
-        layout.addWidget(title)
-        layout.addWidget(card, alignment=Qt.AlignCenter)
-        return w
+        return self.wrap_center(w, 520)
 
     def create_login_page(self):
         body = QWidget()
@@ -1184,12 +982,34 @@ class FaceSystemUI(QMainWindow):
                 self.camera_panel.close()
         except Exception:
             pass
+        try:
+            if hasattr(self, "service") and self.service:
+                self.service.close()
+        except Exception:
+            pass
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 基准宽度设定为 1100，计算缩放比例
+        scale = event.size().width() / 1100.0
+        scale = max(0.6, min(scale, 2.5))  # 限制缩放范围在 0.6x 到 2.5x 之间
+        
+        # 更新全局基础缩放样式
+        self.setStyleSheet(get_qss(scale))
+        
+        # 同步缩放所有的 center card 宽度
+        if hasattr(self, "_scalable_cards"):
+            for card in self._scalable_cards:
+                inner_widget = card.layout().itemAt(0).widget()
+                if inner_widget:
+                    bw = inner_widget.property("base_width")
+                    if bw:
+                        new_w = int(bw * scale)
+                        card.setFixedWidth(new_w)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet(QSS)
-    win = FaceSystemUI()
-    win.show()
+    window = FaceSystemUI()
+    window.show()
     sys.exit(app.exec_())

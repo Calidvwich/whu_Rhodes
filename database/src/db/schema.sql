@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS user (
   password     TEXT NOT NULL,
   phone        TEXT UNIQUE,
   email        TEXT UNIQUE,
+  photo        TEXT,
   create_time  TEXT NOT NULL DEFAULT (datetime('now')),
   status       INTEGER NOT NULL DEFAULT 1,
   role         TEXT NOT NULL DEFAULT 'user' -- 'user' | 'admin'

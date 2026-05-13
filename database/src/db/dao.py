@@ -68,8 +68,56 @@ def get_user_by_username(conn: sqlite3.Connection, username: str) -> UserRow | N
     )
 
 
+def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> UserRow | None:
+    row = conn.execute(
+        """
+        SELECT user_id, username, password, phone, email, status, role
+        FROM user
+        WHERE user_id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return UserRow(
+        user_id=int(row["user_id"]),
+        username=str(row["username"]),
+        password=str(row["password"]),
+        phone=row["phone"],
+        email=row["email"],
+        status=int(row["status"]),
+        role=str(row["role"]),
+    )
+
+
 def update_user_status(conn: sqlite3.Connection, user_id: int, status: int) -> None:
     conn.execute("UPDATE user SET status = ? WHERE user_id = ?", (int(status), int(user_id)))
+    conn.commit()
+
+
+def update_user_info(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    username: str,
+    password_hash: str | None = None,
+    photo: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE user
+        SET username = ?,
+            password = COALESCE(?, password),
+            photo = COALESCE(?, photo)
+        WHERE user_id = ?
+        """,
+        (username, password_hash, photo, int(user_id)),
+    )
+    conn.commit()
+
+
+def delete_user_by_username(conn: sqlite3.Connection, username: str) -> None:
+    conn.execute("DELETE FROM user WHERE username = ?", (username,))
     conn.commit()
 
 
