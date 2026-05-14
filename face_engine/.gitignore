@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+.model_cache/
 examples/verify_samples/
 examples/verify_vectors/
 examples/verify_vectors_local/

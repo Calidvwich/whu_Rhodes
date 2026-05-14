@@ -149,6 +149,7 @@ def build_response(code, success, message, data=None):
 
 # ========= 算法层（对接仓库内 face_engine）=========
 FACE_ENGINE_SRC = PROJECT_ROOT / "face_engine" / "src"
+FACE_ENGINE_MODEL_CACHE = PROJECT_ROOT / "face_engine" / ".model_cache"
 
 
 class FaceAlgorithm:
@@ -234,6 +235,7 @@ class FaceAlgorithm:
                 aligned,
                 l2_normalize_output=True,
                 device=self._device,
+                model_cache=FACE_ENGINE_MODEL_CACHE,
             )
         except Exception as e:
             return {"success": False, "message": str(e), "code": 4043}

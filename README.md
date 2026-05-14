@@ -11,18 +11,19 @@
 请使用 submodule 方式克隆：
 
 ```bash
-git clone --recurse-submodules git@github.com:shanren7/real_time_face_recognition.git
-```
-
-或：
-
-```bash
-git clone --recurse-submodules https://github.com/shanren7/real_time_face_recognition.git
+git clone --recurse-submodules https://github.com/Calidvwich/whu_Rhodes.git
 ```
 
 如果已经克隆但未初始化子模块：
 
 ```bash
+git submodule update --init --recursive
+```
+
+如果本地已有旧版本，请先更新主仓与子模块：
+
+```bash
+git pull
 git submodule update --init --recursive
 ```
 
@@ -50,6 +51,61 @@ git submodule update --remote
   - `python database/scripts/feature_from_json.py enroll ...`
   - `python database/scripts/feature_from_json.py recognize ...`
 - 详细说明见 [database/README.md](database/README.md)
+
+## 四模块联调运行说明
+
+当前主链路已经按 `UI -> face_engine -> database -> UI` 跑通：
+
+1. `UI/face_ui_pyqt5.py` 采集或读取图像。
+2. `face_engine/` 使用 MTCNN 做人脸检测与对齐，并用 FaceNet 提取 `512` 维特征向量。
+3. `database/` 将特征向量写入 SQLite，或与特征库做余弦相似度比对并写识别日志。
+4. UI 根据业务接口返回的 `code / success / message / data / timestamp` 展示结果。
+
+推荐使用 Conda 新建本地环境，不要使用别人机器拷贝来的 `.venv`：
+
+```powershell
+cd <你的 whu_Rhodes 仓库目录>
+
+conda create -n whu_rhodes_ui python=3.12 -y
+conda run -n whu_rhodes_ui python -m pip install -r UI\requirements.txt
+conda run -n whu_rhodes_ui python -m pip install -r face_engine\requirements.txt
+```
+
+初始化本地数据库：
+
+```powershell
+conda run -n whu_rhodes_ui python database\scripts\init_db.py
+```
+
+首次运行算法层时会自动下载 FaceNet 预训练权重。权重缓存目录固定为 `face_engine/.model_cache/`，该目录已被 `.gitignore` 忽略，不要提交到仓库。可先用示例图验证特征提取：
+
+```powershell
+conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str(Path('face_engine/src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(r'face_engine\examples\aligned_face.png', model_cache=r'face_engine\.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
+```
+
+成功时应输出类似：
+
+```text
+(512,) 1.0
+```
+
+启动 PyQt5 UI：
+
+```powershell
+conda run -n whu_rhodes_ui python UI\face_ui_pyqt5.py
+```
+
+本地演示账号由 UI 业务层自动初始化：
+
+- 管理员：`admin` / `admin123`
+- 普通用户：`user1` / `123456`
+
+注意事项：
+
+- `UI/.venv/`、`database/.venv/`、`__pycache__/`、`*.pyc`、`face_engine/.model_cache/` 都不要提交。
+- `database/data/app.sqlite3` 是本地开发数据库。换电脑后如果没有数据库文件，先运行 `database\scripts\init_db.py`，再重新录入人脸特征。
+- 第一次提取特征需要联网下载模型权重；下载完成后会走本地缓存。
+- 当前开发期数据库使用 SQLite，后续如迁移 MySQL，优先改 `database/src/db/connection.py` 与建表 SQL，算法向量接口尽量保持不变。
 
 ## 最小联调流程
 
