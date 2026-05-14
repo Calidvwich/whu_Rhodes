@@ -51,3 +51,5 @@ py -3.12 -m venv .venv
 
 - 主界面（PyQt5）：**`face_ui_pyqt5.py`**
 - 数据库路径在 `face_ui_pyqt5.py` 中指向仓库内 **`../database/`**（与 `UI` 同级）。
+
+

@@ -17,6 +17,7 @@ from src.db.dao import (
     get_config_by_key,
     get_user_by_id,
     get_user_by_username,
+    get_all_users,
     init_schema,
     insert_face_feature,
     insert_recognition_log,
@@ -49,6 +50,8 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -321,6 +324,10 @@ class FaceBusinessService:
             return build_response(4040, False, "用户不存在", {})
         return build_response(0, True, "查询成功", {"user": self._row_to_user_dict(user)})
 
+    def getAllUsers(self):
+        users = get_all_users(self.conn)
+        return build_response(0, True, "查询成功", {"users": [self._row_to_user_dict(u) for u in users]})
+
     def login(self, username, password):
         user = get_user_by_username(self.conn, username)
         if not user:
@@ -479,7 +486,7 @@ class FaceBusinessService:
         update_user_status(self.conn, user_id=target_user.user_id, status=status)
         return build_response(0, True, "状态更新成功", {})
 
-    def updateUser(self, old_username, new_username, new_password, new_photo):
+    def updateUser(self, operator_id, old_username, new_username, new_password, new_photo):
         if not old_username or not new_username:
             return build_response(4060, False, "用户名不能为空", {})
 
@@ -498,6 +505,13 @@ class FaceBusinessService:
             password_hash=password_hash,
             photo=new_photo or None,
         )
+        
+        # 补充：如果修改了照片，则需要重新提取特征并录入数据库，否则无法识别人脸
+        if new_photo:
+            face_resp = self.addFaceFeature(old_user.user_id, new_photo, operator_id)
+            if not face_resp["success"]:
+                return build_response(4064, False, f"用户信息已修改，但人脸特征提取失败: {face_resp['message']}", {})
+
         return build_response(0, True, "用户信息修改成功", {})
 
     def deleteUser(self, username):
@@ -542,6 +556,8 @@ class FaceSystemUI(QMainWindow):
         self.pages["add_user"] = self.create_add_user_page()
         self.pages["edit_user"] = self.create_edit_user_page()
         self.pages["delete_user"] = self.create_delete_user_page()
+        self.pages["user_list"] = self.create_user_list_page()
+        self.pages["user_detail"] = self.create_user_detail_page()
         self.pages["main"] = self.create_main_page()
 
         for p in self.pages.values():
@@ -747,12 +763,16 @@ class FaceSystemUI(QMainWindow):
         lay.addWidget(self.section_title("系统管理模式"))
 
         btn_maintain = QPushButton("用户信息维护")
+        btn_view_all = QPushButton("查看所有信息")
         btn_logout = QPushButton("退出到起始页")
         btn_logout.setProperty("class", "secondary")
+        
         btn_maintain.clicked.connect(lambda: self.go("maintain"))
+        btn_view_all.clicked.connect(self.go_to_user_list)
         btn_logout.clicked.connect(lambda: self.go("start"))
 
         lay.addWidget(btn_maintain)
+        lay.addWidget(btn_view_all)
         lay.addWidget(btn_logout)
 
         page = self.wrap_center(body, 460)
@@ -881,6 +901,98 @@ class FaceSystemUI(QMainWindow):
         page = self.wrap_center(body, 460)
         self._refresh_secondary_style(page)
         return page
+
+    def go_to_user_list(self):
+        resp = self.service.getAllUsers()
+        if resp.get("success"):
+            users = resp["data"].get("users", [])
+            self.user_list_widget.clear()
+            for u in users:
+                item = QListWidgetItem(u["username"])
+                item.setData(Qt.UserRole, u)
+                self.user_list_widget.addItem(item)
+        self.go("user_list")
+
+    def go_to_user_detail(self, item):
+        u = item.data(Qt.UserRole)
+        self.current_detail_user = u
+        self.detail_info_label.setText(
+            f"ID: {u.get('user_id', '')}\n"
+            f"用户名: {u.get('username', '')}\n"
+            f"角色: {u.get('role', '')}\n"
+            f"电话: {u.get('phone', '')}\n"
+            f"邮箱: {u.get('email', '')}\n"
+            f"状态: {u.get('status', '')}"
+        )
+        self.go("user_detail")
+
+    def create_user_list_page(self):
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setSpacing(12)
+        lay.addWidget(self.section_title("所有人员信息"))
+
+        self.user_list_widget = QListWidget()
+        self.user_list_widget.itemDoubleClicked.connect(self.go_to_user_detail)
+        lay.addWidget(self.user_list_widget)
+
+        tips = QLabel("双击用户名查看详细信息")
+        tips.setStyleSheet("color: #7f8c9f; font-size: 12px;")
+        tips.setAlignment(Qt.AlignCenter)
+        lay.addWidget(tips)
+
+        back = QPushButton("返回")
+        back.setProperty("class", "secondary")
+        back.clicked.connect(lambda: self.go("admin_main"))
+        lay.addWidget(back)
+
+        page = self.wrap_center(body, 520)
+        self._refresh_secondary_style(page)
+        return page
+
+    def create_user_detail_page(self):
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setSpacing(12)
+        lay.addWidget(self.section_title("用户详细信息"))
+
+        self.detail_info_label = QLabel()
+        self.detail_info_label.setStyleSheet("font-size: 14px; line-height: 1.5;")
+        lay.addWidget(self.detail_info_label)
+
+        row = QHBoxLayout()
+        edit_btn = QPushButton("修改数据")
+        delete_btn = QPushButton("删除用户")
+        back_btn = QPushButton("返回")
+        back_btn.setProperty("class", "secondary")
+        
+        edit_btn.clicked.connect(self.go_to_edit_from_detail)
+        delete_btn.clicked.connect(self.do_delete_from_detail)
+        back_btn.clicked.connect(lambda: self.go("user_list"))
+
+        row.addWidget(edit_btn)
+        row.addWidget(delete_btn)
+        row.addWidget(back_btn)
+        lay.addLayout(row)
+
+        page = self.wrap_center(body, 520)
+        self._refresh_secondary_style(page)
+        return page
+
+    def go_to_edit_from_detail(self):
+        if hasattr(self, "current_detail_user"):
+            self.edit_old.setText(self.current_detail_user["username"])
+            self.edit_new.setText("")
+            self.edit_pwd.setText("")
+            self.edit_photo.setText("")
+            self.go("edit_user")
+
+    def do_delete_from_detail(self):
+        if hasattr(self, "current_detail_user"):
+            username = self.current_detail_user["username"]
+            self.del_user_name.setText(username)
+            self.do_delete_user()
+            self.go_to_user_list()
 
     def create_main_page(self):
         root = QWidget()
@@ -1014,6 +1126,7 @@ class FaceSystemUI(QMainWindow):
 
     def do_edit_user(self):
         resp = self.service.updateUser(
+            self.current_user_id,
             self.edit_old.text().strip(),
             self.edit_new.text().strip(),
             self.edit_pwd.text().strip(),

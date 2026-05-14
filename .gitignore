@@ -1,3 +1,5 @@
 .codex
 ./UI/.venv/
 venv/
+.venv/
+UI/__pycache__/

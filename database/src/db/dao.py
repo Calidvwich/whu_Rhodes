@@ -89,6 +89,27 @@ def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> UserRow | None:
         role=str(row["role"]),
     )
 
+def get_all_users(conn: sqlite3.Connection) -> list[UserRow]:
+    rows = conn.execute(
+        """
+        SELECT user_id, username, password, phone, email, status, role
+        FROM user
+        ORDER BY user_id ASC
+        """
+    ).fetchall()
+    return [
+        UserRow(
+            user_id=int(row["user_id"]),
+            username=str(row["username"]),
+            password=str(row["password"]),
+            phone=row["phone"],
+            email=row["email"],
+            status=int(row["status"]),
+            role=str(row["role"]),
+        )
+        for row in rows
+    ]
+
 
 def update_user_status(conn: sqlite3.Connection, user_id: int, status: int) -> None:
     conn.execute("UPDATE user SET status = ? WHERE user_id = ?", (int(status), int(user_id)))
