@@ -147,6 +147,100 @@ def build_response(code, success, message, data=None):
     }
 
 
+# ========= 算法层（对接仓库内 face_engine）=========
+FACE_ENGINE_SRC = PROJECT_ROOT / "face_engine" / "src"
+
+
+class FaceAlgorithm:
+    """
+    使用仓库 `face_engine`：检测+对齐到 160×160，再 FaceNet 提 512 维向量。
+    摄像头/OpenCV 帧为 BGR，此处统一转为 RGB 再送入预处理。
+    """
+
+    def __init__(self, *, device: str | None = None) -> None:
+        self._device = device
+        self._preprocess_face_image = None
+        self._extract_from_aligned_face = None
+
+    def _ensure_face_engine(self) -> None:
+        if self._preprocess_face_image is not None:
+            return
+        src = FACE_ENGINE_SRC
+        if not src.is_dir():
+            raise FileNotFoundError(f"未找到 face_engine 源码目录: {src}")
+        p = src.as_posix()
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        try:
+            from face_engine import extract_from_aligned_face, preprocess_face_image
+        except ImportError as e:
+            raise ImportError(
+                "无法加载 face_engine（通常缺少 torch 等依赖）。"
+                "请在 UI 的 venv 中执行: pip install -r ../face_engine/requirements.txt"
+            ) from e
+        self._preprocess_face_image = preprocess_face_image
+        self._extract_from_aligned_face = extract_from_aligned_face
+
+    @staticmethod
+    def _to_rgb_numpy(image) -> "np.ndarray":
+        if np is None:
+            raise RuntimeError("未安装 NumPy")
+        if isinstance(image, str) and image.strip():
+            if cv2 is None:
+                raise RuntimeError("未安装 OpenCV，无法读取图像路径")
+            bgr = cv2.imread(image)
+            if bgr is None:
+                raise RuntimeError(f"无法读取图像: {image}")
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        arr = np.asarray(image)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise RuntimeError(f"图像维度无效: {arr.shape}")
+        if arr.dtype not in (np.uint8, np.float32, np.float64):
+            arr = arr.astype(np.uint8)
+        if arr.dtype != np.uint8 and np.issubdtype(arr.dtype, np.floating):
+            arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+        if cv2 is not None:
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        return arr
+
+    def process_to_feature_vector(self, image) -> dict:
+        """
+        返回 dict:
+          - 成功: {success: True, feature_vector: np.ndarray(512,), code: 0}
+          - 失败: {success: False, message: str, code: int}
+        """
+        if image is None:
+            return {"success": False, "message": "图像为空", "code": 4041}
+        try:
+            self._ensure_face_engine()
+        except Exception as e:
+            return {"success": False, "message": str(e), "code": 5005}
+
+        try:
+            rgb = self._to_rgb_numpy(image)
+        except Exception as e:
+            return {"success": False, "message": str(e), "code": 4033}
+
+        try:
+            aligned = self._preprocess_face_image(rgb, device=self._device)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "no face" in err or "confidence" in err or "below threshold" in err:
+                return {"success": False, "message": "未检测到人脸", "code": 4042}
+            return {"success": False, "message": str(e), "code": 4042}
+
+        try:
+            vec = self._extract_from_aligned_face(
+                aligned,
+                l2_normalize_output=True,
+                device=self._device,
+            )
+        except Exception as e:
+            return {"success": False, "message": str(e), "code": 4043}
+
+        return {"success": True, "feature_vector": vec, "code": 0}
+
+
 # ========= 业务逻辑层 =========
 class FaceBusinessService:
     def __init__(self):
@@ -275,15 +369,12 @@ class FaceBusinessService:
         if image is None:
             return build_response(4033, False, "图像格式不合法或路径无效", {"feature_id": None})
 
-        detect_resp = self.algorithm.detect_face(image)
-        if not detect_resp["success"]:
-            return build_response(4034, False, "未检测到有效人脸", {"feature_id": None})
-
-        x, y, w, h = detect_resp["data"]["face_region"][0]
-        face_image = image[y:y + h, x:x + w]
-        extract_resp = self.algorithm.extract_feature(face_image)
-        if not extract_resp["success"]:
-            return build_response(4035, False, "特征提取失败", {"feature_id": None})
+        feat = self.algorithm.process_to_feature_vector(image)
+        if not feat.get("success"):
+            c = int(feat.get("code") or 4035)
+            if c == 4042 or "未检测" in str(feat.get("message", "")):
+                return build_response(4034, False, "未检测到有效人脸", {"feature_id": None})
+            return build_response(4035, False, feat.get("message", "特征提取失败"), {"feature_id": None})
 
         image_path = image_file if isinstance(image_file, str) else "memory_frame"
         if np is None:
@@ -292,7 +383,7 @@ class FaceBusinessService:
         feature_id = insert_face_feature(
             self.conn,
             user_id=int(user_id),
-            feature_vector=np.asarray(extract_resp["data"]["feature_vector"], dtype=np.float32),
+            feature_vector=np.asarray(feat["feature_vector"], dtype=np.float32),
             image_path=image_path,
         )
         return build_response(0, True, "录入成功", {"feature_id": feature_id})
@@ -306,8 +397,8 @@ class FaceBusinessService:
                 "result": "识别失败",
             })
 
-        detect_resp = self.algorithm.detect_face(image_data)
-        if not detect_resp["success"]:
+        feat = self.algorithm.process_to_feature_vector(image_data)
+        if not feat.get("success"):
             insert_recognition_log(
                 self.conn,
                 user_id=None,
@@ -316,26 +407,15 @@ class FaceBusinessService:
                 result=0,
                 device_info=device_info,
             )
-            return build_response(4042, False, "未检测到人脸", {
-                "user_id": None,
-                "username": None,
-                "similarity": 0.0,
-                "result": "未识别",
-            })
-
-        x, y, w, h = detect_resp["data"]["face_region"][0]
-        face = image_data[y:y + h, x:x + w]
-        extract_resp = self.algorithm.extract_feature(face)
-        if not extract_resp["success"]:
-            insert_recognition_log(
-                self.conn,
-                user_id=None,
-                input_image_url="memory_frame",
-                similarity=0.0,
-                result=0,
-                device_info=device_info,
-            )
-            return build_response(4043, False, "特征提取失败", {
+            c = int(feat.get("code") or 4043)
+            if c == 4042:
+                return build_response(4042, False, "未检测到人脸", {
+                    "user_id": None,
+                    "username": None,
+                    "similarity": 0.0,
+                    "result": "未识别",
+                })
+            return build_response(4043, False, feat.get("message", "特征提取失败"), {
                 "user_id": None,
                 "username": None,
                 "similarity": 0.0,
@@ -343,7 +423,7 @@ class FaceBusinessService:
             })
 
         threshold = float(get_config_by_key(self.conn, "threshold") or get_config_by_key(self.conn, "recognition_threshold") or "0.80")
-        feature_vector = np.asarray(extract_resp["data"]["feature_vector"], dtype=np.float32) if np is not None else extract_resp["data"]["feature_vector"]
+        feature_vector = np.asarray(feat["feature_vector"], dtype=np.float32) if np is not None else feat["feature_vector"]
         library = list(iter_all_active_features(self.conn))
         compare_resp = match_best(feature_vector, library, threshold=threshold)
 
