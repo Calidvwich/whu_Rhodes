@@ -58,7 +58,7 @@ def cmd_recognize(args: argparse.Namespace) -> None:
 
     conn = connect(DbConfig(path=db_path))
     try:
-        threshold = float(get_config_by_key(conn, "threshold") or "0.80")
+        threshold = float(get_config_by_key(conn, "threshold") or "0.65")
         lib = list(iter_all_active_features(conn))
         result = match_best(vec, lib, threshold=threshold)
 

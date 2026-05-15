@@ -44,5 +44,5 @@ CREATE TABLE IF NOT EXISTS system_config (
 );
 
 INSERT OR IGNORE INTO system_config (config_key, config_value, description)
-VALUES ('threshold', '0.80', 'cosine similarity threshold');
+VALUES ('threshold', '0.65', 'cosine similarity threshold');
 

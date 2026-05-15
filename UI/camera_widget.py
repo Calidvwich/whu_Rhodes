@@ -11,7 +11,7 @@ prepare_qt_runtime()
 
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QMessageBox
+from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout
 
 
 def _optional_import(module_name):
@@ -162,16 +162,30 @@ class CameraThread(QThread):
 
         if self.cap:
             self.cap.release()
+            self.cap = None
 
     def stop(self):
         self.running = False
         self.wait()
 
 
+class CameraScanThread(QThread):
+    scan_finished = pyqtSignal(object)
+
+    def __init__(self, max_index=8, skip_indices=None):
+        super().__init__()
+        self.max_index = int(max_index)
+        self.skip_indices = list(skip_indices or [])
+
+    def run(self):
+        self.scan_finished.emit(scan_available_cameras(self.max_index, self.skip_indices))
+
+
 class CameraPanel(QWidget):
     frame_captured = pyqtSignal(object)
+    camera_error = pyqtSignal(str, int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, camera_index=0):
         super().__init__(parent)
 
         self.label = QLabel("等待摄像头...")
@@ -202,7 +216,9 @@ class CameraPanel(QWidget):
     def start_camera(self):
         if self.thread and self.thread.isRunning():
             return
-        self.thread = CameraThread(camera_index=0)
+        self.source_kind = "local"
+        self.label.setText(f"正在连接 camera:{self.current_camera_index} ...")
+        self.thread = CameraThread(camera_index=self.current_camera_index)
         self.thread.frame_ready.connect(self.update_frame)
         self.thread.camera_lost.connect(self.on_camera_lost)
         self.thread.start()
@@ -226,7 +242,7 @@ class CameraPanel(QWidget):
     def try_reconnect(self):
         if self.thread and self.thread.isRunning():
             return
-        self.start_camera()
+        self.start_camera(self.current_camera_index)
 
     def update_frame(self, frame_bgr):
         if cv2 is None:
@@ -244,25 +260,50 @@ class CameraPanel(QWidget):
             backend = self.thread.backend_name or "-"
             self.info_label.setText(f"设备: camera:0  后端: {backend}")
 
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
         pix = QPixmap.fromImage(qimg).scaled(
             self.label.width(), self.label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.label.setPixmap(pix)
 
-    def captureFrame(self, camera_id=0, resolution="640x480", frame_rate=30):
+    def captureFrame(self, camera_id=None, resolution="640x480", frame_rate=30):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if self.last_frame is not None:
+        if self.source_kind == "mobile":
+            if self.last_frame is None:
+                return {
+                    "code": 5006,
+                    "success": False,
+                    "message": "尚未收到手机浏览器画面",
+                    "data": {"frame_data": None, "device_info": "mobile-browser"},
+                    "timestamp": now_str,
+                }
             return {
                 "code": 0,
                 "success": True,
                 "message": "采集成功",
                 "data": {
                     "frame_data": self.last_frame,
-                    "camera_id": camera_id,
+                    "camera_id": "mobile-browser",
+                    "device_info": "mobile-browser",
+                    "resolution": resolution,
+                    "frame_rate": frame_rate,
+                },
+                "timestamp": now_str,
+            }
+
+        target_camera_id = self.current_camera_index if camera_id is None else int(camera_id)
+        if self.last_frame is not None and target_camera_id == self.current_camera_index:
+            return {
+                "code": 0,
+                "success": True,
+                "message": "采集成功",
+                "data": {
+                    "frame_data": self.last_frame,
+                    "camera_id": target_camera_id,
+                    "device_info": f"camera:{target_camera_id}",
                     "resolution": resolution,
                     "frame_rate": frame_rate,
                 },
@@ -274,7 +315,7 @@ class CameraPanel(QWidget):
                 "code": 5003,
                 "success": False,
                 "message": "未安装 OpenCV，无法采集图像",
-                "data": {"frame_data": None},
+                "data": {"frame_data": None, "device_info": f"camera:{target_camera_id}"},
                 "timestamp": now_str,
             }
 
@@ -306,18 +347,20 @@ class CameraPanel(QWidget):
                 "code": 5002,
                 "success": False,
                 "message": "采集超时或读取失败",
-                "data": {"frame_data": None},
+                "data": {"frame_data": None, "device_info": f"camera:{target_camera_id}"},
                 "timestamp": now_str,
             }
 
-        self.last_frame = frame
+        if target_camera_id == self.current_camera_index:
+            self.last_frame = frame
         return {
             "code": 0,
             "success": True,
             "message": "采集成功",
             "data": {
                 "frame_data": frame,
-                "camera_id": camera_id,
+                "camera_id": target_camera_id,
+                "device_info": f"camera:{target_camera_id}",
                 "resolution": f"{width}x{height}",
                 "frame_rate": frame_rate,
                 "backend": backend_name,
@@ -326,6 +369,6 @@ class CameraPanel(QWidget):
         }
 
     def closeEvent(self, event):
-        if self.thread:
-            self.thread.stop()
+        self.stop_camera()
         super().closeEvent(event)
+
