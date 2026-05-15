@@ -45,6 +45,7 @@ def get_db_conn():
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -820,14 +821,21 @@ class FaceSystemUI(QMainWindow):
         self.add_user_phone.setPlaceholderText("手机号")
         self.add_user_email = QLineEdit()
         self.add_user_email.setPlaceholderText("邮箱")
+
+        photo_layout = QHBoxLayout()
         self.add_user_photo = QLineEdit()
         self.add_user_photo.setPlaceholderText("人脸图片路径（可选）")
+        browse_btn = QPushButton("浏览...")
+        browse_btn.setProperty("class", "secondary")
+        browse_btn.clicked.connect(lambda: self._choose_image(self.add_user_photo))
+        photo_layout.addWidget(self.add_user_photo)
+        photo_layout.addWidget(browse_btn)
 
         lay.addWidget(self.add_user_name)
         lay.addWidget(self.add_user_pwd)
         lay.addWidget(self.add_user_phone)
         lay.addWidget(self.add_user_email)
-        lay.addWidget(self.add_user_photo)
+        lay.addLayout(photo_layout)
 
         row = QHBoxLayout()
         ok = QPushButton("确定")
@@ -856,13 +864,20 @@ class FaceSystemUI(QMainWindow):
         self.edit_pwd = QLineEdit()
         self.edit_pwd.setPlaceholderText("新密码（可留空）")
         self.edit_pwd.setEchoMode(QLineEdit.Password)
+
+        photo_layout = QHBoxLayout()
         self.edit_photo = QLineEdit()
         self.edit_photo.setPlaceholderText("新照片路径（可选）")
+        browse_edit_btn = QPushButton("浏览...")
+        browse_edit_btn.setProperty("class", "secondary")
+        browse_edit_btn.clicked.connect(lambda: self._choose_image(self.edit_photo))
+        photo_layout.addWidget(self.edit_photo)
+        photo_layout.addWidget(browse_edit_btn)
 
         lay.addWidget(self.edit_old)
         lay.addWidget(self.edit_new)
         lay.addWidget(self.edit_pwd)
-        lay.addWidget(self.edit_photo)
+        lay.addLayout(photo_layout)
 
         row = QHBoxLayout()
         ok = QPushButton("确定")
@@ -978,6 +993,11 @@ class FaceSystemUI(QMainWindow):
         page = self.wrap_center(body, 520)
         self._refresh_secondary_style(page)
         return page
+
+    def _choose_image(self, line_edit):
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if file_path:
+            line_edit.setText(file_path)
 
     def go_to_edit_from_detail(self):
         if hasattr(self, "current_detail_user"):
