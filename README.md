@@ -95,6 +95,30 @@ conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib i
 conda run -n whu_rhodes_ui python UI\face_ui_pyqt5.py
 ```
 
+关于摄像头：
+
+- 若需要稳定使用本机 Windows 摄像头，优先在 Windows 原生终端中运行上面的命令。
+- 当前 UI 在 Windows 下会依次尝试 `DirectShow`、`Media Foundation` 和 OpenCV 自动后端。
+- 若你是在 WSL 中运行，只有当 Linux 侧真的出现 `/dev/video*` 设备时，OpenCV 才能打开摄像头。
+
+如果你是在 Linux / WSL 下运行 PyQt5 UI，请额外注意：
+
+- WSLg 环境建议优先走 Wayland：
+
+```bash
+env QT_QPA_PLATFORM=wayland conda run -n whu_rhodes_ui python UI/face_ui_pyqt5.py
+```
+
+- 若仍报 `Could not load the Qt platform plugin "xcb"`，先补齐系统库：
+
+```bash
+sudo apt update
+sudo apt install -y libxcb-icccm4 libxcb-keysyms1
+```
+
+- 若 UI 明确提示 “WSL2 中没有任何 `/dev/video*` 设备”，说明当前不是代码问题，而是 WSL 环境还没有拿到摄像头设备。此时请优先改为 Windows 原生运行；若必须在 WSL 中使用，请先用 `usbipd-win` 将 USB 摄像头附加到 WSL。
+- 当前 UI 已在代码里优先使用 `PyQt5` 自身的 Qt 插件目录，避免 `opencv-python` 自带的 `cv2/qt/plugins` 干扰 PyQt5 启动。
+
 本地演示账号由 UI 业务层自动初始化：
 
 - 管理员：`admin` / `admin123`

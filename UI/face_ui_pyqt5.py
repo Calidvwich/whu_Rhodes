@@ -6,6 +6,10 @@ import importlib
 from datetime import datetime
 from pathlib import Path
 
+from qt_bootstrap import prepare_qt_runtime
+
+prepare_qt_runtime()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATABASE_ROOT = PROJECT_ROOT / "database"
 if DATABASE_ROOT.as_posix() not in sys.path:
@@ -1060,6 +1064,9 @@ class FaceSystemUI(QMainWindow):
         cam_layout.addWidget(self.cam_status)
         cam_layout.addWidget(self.cam_info)
         cam_status_panel = self.make_panel("摄像头状态", content_widget=cam_content)
+        self.camera_panel.bind_status_labels(self.cam_status, self.cam_info)
+        self.cam_status.setText("状态: 连接中")
+        self.cam_info.setText("设备: camera:0  后端: 检测中")
 
         match_content = QWidget()
         match_layout = QVBoxLayout(match_content)
@@ -1173,7 +1180,9 @@ class FaceSystemUI(QMainWindow):
 
         self.cam_status.setText("状态: 已连接")
         self.cam_info.setText(
-            f"设备: camera:{capture_resp['data']['camera_id']}  分辨率: {capture_resp['data']['resolution']}"
+            "设备: camera:"
+            f"{capture_resp['data']['camera_id']}  分辨率: {capture_resp['data']['resolution']}  "
+            f"后端: {capture_resp['data'].get('backend') or '-'}"
         )
 
         frame = capture_resp["data"]["frame_data"]
