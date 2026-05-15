@@ -3,6 +3,7 @@ import math
 import os
 import hashlib
 import importlib
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from src.db.dao import (
 )
 from src.feature.matcher import match_best
 
+DEFAULT_RECOGNITION_THRESHOLD = "0.65"
+
 
 def get_db_conn():
     db_path = DATABASE_ROOT / "data" / "app.sqlite3"
@@ -36,15 +39,21 @@ def get_db_conn():
     conn = connect(DbConfig(path=db_path))
     schema_sql = schema_path.read_text(encoding="utf-8")
     init_schema(conn, schema_sql)
+    current_threshold = get_config_by_key(conn, "threshold")
+    if current_threshold in (None, "0.80"):
+        update_config(conn, "threshold", DEFAULT_RECOGNITION_THRESHOLD, "cosine similarity threshold")
     columns = {row[1] for row in conn.execute("PRAGMA table_info(user)")}
     if "photo" not in columns:
         conn.execute("ALTER TABLE user ADD COLUMN photo TEXT")
         conn.commit()
     return conn
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -62,7 +71,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from camera_widget import CameraPanel
+from camera_widget import CameraPanel, CameraScanThread
 
 
 def _optional_import(module_name):
@@ -75,6 +84,7 @@ def _optional_import(module_name):
 cv2 = _optional_import("cv2")
 np = _optional_import("numpy")
 bcrypt_mod = _optional_import("bcrypt")
+qrcode_mod = _optional_import("qrcode")
 
 
 # ========= 全局样式 =========
@@ -432,7 +442,7 @@ class FaceBusinessService:
                 "result": "识别失败",
             })
 
-        threshold = float(get_config_by_key(self.conn, "threshold") or get_config_by_key(self.conn, "recognition_threshold") or "0.80")
+        threshold = float(get_config_by_key(self.conn, "threshold") or get_config_by_key(self.conn, "recognition_threshold") or DEFAULT_RECOGNITION_THRESHOLD)
         feature_vector = np.asarray(feat["feature_vector"], dtype=np.float32) if np is not None else feat["feature_vector"]
         library = list(iter_all_active_features(self.conn))
         compare_resp = match_best(feature_vector, library, threshold=threshold)
@@ -535,6 +545,8 @@ class FaceBusinessService:
 
 # ========= 界面层 =========
 class FaceSystemUI(QMainWindow):
+    mobile_frame_received = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("人脸识别系统")
@@ -544,6 +556,13 @@ class FaceSystemUI(QMainWindow):
         self.current_user = None
         self.current_user_id = None
         self.current_role = None
+        self.camera_scan_thread = None
+        self.mobile_camera_server = None
+        self.mobile_camera_url = ""
+        self.mobile_scan_dialog = None
+        self.mobile_scan_qr_label = None
+        self.mobile_scan_url_label = None
+        self.mobile_frame_received.connect(self.on_mobile_frame_received)
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -1030,6 +1049,7 @@ class FaceSystemUI(QMainWindow):
 
         self.camera_panel = CameraPanel()
         self.camera_panel.frame_captured.connect(self.on_frame_captured)
+        self.camera_panel.camera_error.connect(self.on_camera_error)
         video_panel = self.make_panel("实时视频监控区", content_widget=self.camera_panel)
 
         result_content = QWidget()
@@ -1057,13 +1077,33 @@ class FaceSystemUI(QMainWindow):
         cam_layout = QVBoxLayout(cam_content)
         self.cam_status = QLabel("状态: 待连接")
         self.cam_info = QLabel("设备: camera:0")
+        self.camera_combo = QComboBox()
+        self.camera_combo.setMinimumHeight(36)
+        camera_btn_row = QHBoxLayout()
+        self.refresh_camera_btn = QPushButton("刷新设备")
+        self.refresh_camera_btn.setProperty("class", "secondary")
+        self.switch_camera_btn = QPushButton("切换")
+        self.switch_camera_btn.setProperty("class", "secondary")
+        self.refresh_camera_btn.clicked.connect(self.refresh_camera_devices)
+        self.switch_camera_btn.clicked.connect(self.switch_selected_camera)
+        camera_btn_row.addWidget(self.refresh_camera_btn)
+        camera_btn_row.addWidget(self.switch_camera_btn)
+        self.mobile_camera_btn = QPushButton("启用手机摄像头")
+        self.mobile_camera_btn.clicked.connect(self.toggle_mobile_camera)
+        camera_tip = QLabel("手机和电脑需连接同一 Wi-Fi 或电脑热点。点击启用后扫码授权。")
+        camera_tip.setWordWrap(True)
+        camera_tip.setStyleSheet("color: #7f8c9f; font-size: 12px;")
         cam_layout.addWidget(self.cam_status)
         cam_layout.addWidget(self.cam_info)
+        cam_layout.addWidget(self.camera_combo)
+        cam_layout.addLayout(camera_btn_row)
+        cam_layout.addWidget(self.mobile_camera_btn)
+        cam_layout.addWidget(camera_tip)
         cam_status_panel = self.make_panel("摄像头状态", content_widget=cam_content)
 
         match_content = QWidget()
         match_layout = QVBoxLayout(match_content)
-        self.match_desc = QLabel("识别阈值: 0.82")
+        self.match_desc = QLabel("识别阈值: 0.65")
         self.log_hint = QLabel("日志: 自动记录 device_info")
         match_layout.addWidget(self.match_desc)
         match_layout.addWidget(self.log_hint)
@@ -1084,10 +1124,282 @@ class FaceSystemUI(QMainWindow):
         outer.addLayout(btn_row)
 
         self._refresh_secondary_style(root)
+        self.refresh_camera_devices()
         return root
 
     def on_frame_captured(self, _frame):
         self.cam_status.setText("状态: 已连接")
+        device_info = self.camera_panel.selected_device_info()
+        if device_info.startswith("camera:"):
+            camera_id = self.camera_panel.selected_camera_id()
+            self._ensure_camera_option(camera_id)
+        self.cam_info.setText(f"设备: {device_info}")
+
+    def on_camera_error(self, msg, camera_id):
+        self.cam_status.setText("状态: 连接失败")
+        self.cam_info.setText(f"设备: camera:{camera_id}  {msg}")
+
+    @staticmethod
+    def _camera_label(camera_id):
+        camera_id = int(camera_id)
+        if camera_id == 0:
+            return "电脑摄像头 camera:0"
+        return f"可用摄像头 camera:{camera_id}"
+
+    def _ensure_camera_option(self, camera_id):
+        camera_id = int(camera_id)
+        for row in range(self.camera_combo.count()):
+            if self.camera_combo.itemData(row) == camera_id:
+                self.camera_combo.setEnabled(True)
+                self.switch_camera_btn.setEnabled(True)
+                return
+
+        if self.camera_combo.count() == 1 and self.camera_combo.itemData(0) == -1:
+            self.camera_combo.clear()
+        self.camera_combo.addItem(self._camera_label(camera_id), camera_id)
+        self.camera_combo.setCurrentIndex(self.camera_combo.count() - 1)
+        self.camera_combo.setEnabled(True)
+        self.switch_camera_btn.setEnabled(True)
+
+    def refresh_camera_devices(self):
+        if self.camera_scan_thread and self.camera_scan_thread.isRunning():
+            return
+
+        skip = []
+        if self.camera_panel.no_camera_timer.isActive():
+            self.camera_panel.no_camera_timer.stop()
+        if (
+            self.camera_panel.source_kind == "local"
+            and self.camera_panel.thread is not None
+            and self.camera_panel.thread.isRunning()
+        ):
+            skip.append(self.camera_panel.selected_camera_id())
+
+        self.refresh_camera_btn.setEnabled(False)
+        self.refresh_camera_btn.setText("刷新中...")
+        self.camera_scan_thread = CameraScanThread(max_index=8, skip_indices=skip)
+        self.camera_scan_thread.scan_finished.connect(self.on_camera_scan_finished)
+        self.camera_scan_thread.finished.connect(lambda: self.refresh_camera_btn.setEnabled(True))
+        self.camera_scan_thread.finished.connect(lambda: self.refresh_camera_btn.setText("刷新设备"))
+        self.camera_scan_thread.start()
+
+    def on_camera_scan_finished(self, devices):
+        current_camera = self.camera_panel.selected_camera_id()
+        devices = list(devices)
+        if (
+            self.camera_panel.source_kind == "local"
+            and self.camera_panel.last_frame is not None
+            and all(int(d["index"]) != current_camera for d in devices)
+        ):
+            devices.insert(0, {
+                "index": current_camera,
+                "name": self._camera_label(current_camera),
+            })
+
+        self.camera_combo.clear()
+        if not devices:
+            self.camera_combo.addItem("未检测到可用摄像头", -1)
+            self.camera_combo.setEnabled(False)
+            self.switch_camera_btn.setEnabled(False)
+            self.cam_status.setText("状态: 未检测到摄像头")
+            self.cam_info.setText("设备: -")
+            return
+
+        self.camera_combo.setEnabled(True)
+        self.switch_camera_btn.setEnabled(True)
+        selected_row = 0
+        for row, device in enumerate(devices):
+            camera_id = int(device["index"])
+            self.camera_combo.addItem(device.get("name") or self._camera_label(camera_id), camera_id)
+            if camera_id == current_camera:
+                selected_row = row
+        self.camera_combo.setCurrentIndex(selected_row)
+        self.cam_info.setText(f"设备: camera:{current_camera}")
+        if self.cam_status.text() in {"状态: 待连接", "状态: 未检测到摄像头"}:
+            self.cam_status.setText("状态: 正在连接")
+
+    def switch_selected_camera(self):
+        camera_id = self.camera_combo.currentData()
+        if camera_id is None or int(camera_id) < 0:
+            self.err("未检测到可切换的摄像头，请先连接设备并点击刷新。")
+            return
+
+        camera_id = int(camera_id)
+        self.stop_mobile_camera(silent=True)
+        self.cam_status.setText("状态: 正在连接")
+        self.cam_info.setText(f"设备: camera:{camera_id}")
+        self.camera_panel.switch_camera(camera_id)
+
+    def toggle_mobile_camera(self):
+        if self.mobile_camera_server is None:
+            self.start_mobile_camera()
+        elif self.camera_panel.source_kind == "mobile" and self.camera_panel.last_frame is not None:
+            self.stop_mobile_camera()
+        else:
+            self._show_mobile_scan_dialog()
+
+    def _set_mobile_button_running(self, running):
+        if running:
+            self.mobile_camera_btn.setText("停止手机摄像头")
+            self.mobile_camera_btn.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    font-weight: 700;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
+                }
+                QPushButton:pressed {
+                    background-color: #b91c1c;
+                }
+                """
+            )
+            return
+
+        self.mobile_camera_btn.setText("启用手机摄像头")
+        self.mobile_camera_btn.setStyleSheet("")
+
+    def start_mobile_camera(self):
+        if self.mobile_camera_server is not None:
+            self._show_mobile_scan_dialog()
+            return
+
+        server_mod = _optional_import("mobile_camera_server")
+        if server_mod is None:
+            self.err("缺少手机扫码依赖，请先安装 UI/requirements.txt 中的 cryptography。")
+            return
+
+        try:
+            self.mobile_camera_server = server_mod.MobileCameraServer(
+                lambda frame_bytes: self.mobile_frame_received.emit(frame_bytes)
+            )
+            self.mobile_camera_url = self.mobile_camera_server.start()
+        except Exception as e:
+            self.mobile_camera_server = None
+            self.err(f"启动手机摄像头服务失败: {e}")
+            return
+
+        self.camera_panel.use_mobile_source()
+        self.cam_status.setText("状态: 等待手机扫码")
+        self.cam_info.setText("设备: mobile-browser")
+        self._set_mobile_button_running(False)
+        self._show_mobile_scan_dialog()
+
+    def stop_mobile_camera(self, silent=False):
+        was_mobile_source = (
+            hasattr(self, "camera_panel")
+            and self.camera_panel
+            and self.camera_panel.source_kind == "mobile"
+        )
+
+        if self.mobile_camera_server is not None:
+            try:
+                self.mobile_camera_server.stop()
+            finally:
+                self.mobile_camera_server = None
+                self.mobile_camera_url = ""
+
+        self._close_mobile_scan_dialog()
+        self._set_mobile_button_running(False)
+
+        if was_mobile_source and not silent:
+            camera_id = self.camera_combo.currentData()
+            if camera_id is None or int(camera_id) < 0:
+                camera_id = self.camera_panel.selected_camera_id()
+            self.camera_panel.switch_camera(int(camera_id))
+            self.cam_status.setText("状态: 正在恢复电脑摄像头")
+            self.cam_info.setText(f"设备: camera:{int(camera_id)}")
+            return
+
+        if not silent:
+            self.cam_status.setText("状态: 手机服务已停止")
+
+    def _show_mobile_scan_dialog(self):
+        self._close_mobile_scan_dialog()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("启用手机摄像头")
+        dialog.setModal(False)
+        dialog.resize(360, 470)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+
+        title = QLabel("手机扫码连接")
+        title.setObjectName("subtitle")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        qr_label = QLabel("二维码生成中...")
+        qr_label.setAlignment(Qt.AlignCenter)
+        qr_label.setMinimumSize(240, 240)
+        qr_label.setStyleSheet("background: #ffffff; color: #7f8c9f; border: 1px dashed #cad5e6;")
+        layout.addWidget(qr_label)
+
+        url_label = QLabel(
+            f"手机扫码访问: {self.mobile_camera_url}\n"
+            "手机和电脑需连接同一 Wi-Fi 或电脑热点。\n"
+            "首次访问 HTTPS 可能需要接受证书提示，然后允许浏览器使用摄像头。"
+        )
+        url_label.setWordWrap(True)
+        url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        url_label.setStyleSheet("color: #334155; font-size: 12px;")
+        layout.addWidget(url_label)
+
+        wait_label = QLabel("检测到手机开始传输画面后，此窗口会自动关闭。")
+        wait_label.setWordWrap(True)
+        wait_label.setStyleSheet("color: #7f8c9f; font-size: 12px;")
+        layout.addWidget(wait_label)
+
+        self.mobile_scan_dialog = dialog
+        self.mobile_scan_qr_label = qr_label
+        self.mobile_scan_url_label = url_label
+        self._set_mobile_qr(self.mobile_camera_url)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _close_mobile_scan_dialog(self):
+        if self.mobile_scan_dialog is not None:
+            self.mobile_scan_dialog.close()
+        self.mobile_scan_dialog = None
+        self.mobile_scan_qr_label = None
+        self.mobile_scan_url_label = None
+
+    def _set_mobile_qr(self, url):
+        if self.mobile_scan_qr_label is None:
+            return
+        if qrcode_mod is None:
+            self.mobile_scan_qr_label.setText("缺少 qrcode 依赖，无法生成二维码")
+            return
+
+        img = qrcode_mod.make(url)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        pix.loadFromData(buf.getvalue(), "PNG")
+        self.mobile_scan_qr_label.setPixmap(pix.scaled(240, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def on_mobile_frame_received(self, frame_bytes):
+        if self.mobile_camera_server is None:
+            return
+        if cv2 is None or np is None:
+            self.cam_status.setText("状态: 缺少 OpenCV 或 NumPy，无法解码手机画面")
+            return
+
+        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            self.cam_status.setText("状态: 手机画面解码失败")
+            return
+
+        self.camera_panel.update_mobile_frame(frame)
+        self._close_mobile_scan_dialog()
+        self._set_mobile_button_running(True)
+        self.cam_status.setText("状态: 手机已连接")
+        self.cam_info.setText("设备: mobile-browser")
 
     def do_login(self):
         username = self.login_user.text().strip()
@@ -1165,20 +1477,21 @@ class FaceSystemUI(QMainWindow):
             self.err(resp["message"])
 
     def do_recognize(self):
-        capture_resp = self.camera_panel.captureFrame(camera_id=0, resolution="640x480", frame_rate=25)
+        capture_resp = self.camera_panel.captureFrame(resolution="640x480", frame_rate=25)
         if not capture_resp["success"]:
             self.cam_status.setText("状态: 采集失败")
             self.err(capture_resp["message"])
             return
 
         self.cam_status.setText("状态: 已连接")
+        device_info = capture_resp["data"].get("device_info") or f"camera:{capture_resp['data']['camera_id']}"
         self.cam_info.setText(
-            f"设备: camera:{capture_resp['data']['camera_id']}  分辨率: {capture_resp['data']['resolution']}"
+            f"设备: {device_info}  分辨率: {capture_resp['data']['resolution']}"
         )
 
         frame = capture_resp["data"]["frame_data"]
         request_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        recog_resp = self.service.recognizeFace(frame, "camera:0", request_time)
+        recog_resp = self.service.recognizeFace(frame, device_info, request_time)
 
         data = recog_resp["data"]
         self.result_user.setText(f"用户: {data.get('username') or '-'}")
@@ -1192,6 +1505,15 @@ class FaceSystemUI(QMainWindow):
             self.err(recog_resp["message"])
 
     def closeEvent(self, event):
+        try:
+            self.stop_mobile_camera(silent=True)
+        except Exception:
+            pass
+        try:
+            if self.camera_scan_thread and self.camera_scan_thread.isRunning():
+                self.camera_scan_thread.wait(1500)
+        except Exception:
+            pass
         try:
             if hasattr(self, "camera_panel") and self.camera_panel:
                 self.camera_panel.close()

@@ -42,7 +42,7 @@ def main() -> None:
         # 3) build an input vector close to that user
         input_vec = l2_normalize(base + rng.normal(scale=0.01, size=(VECTOR_DIM,)).astype(np.float32))
 
-        threshold = float(get_config_by_key(conn, "threshold") or "0.80")
+        threshold = float(get_config_by_key(conn, "threshold") or "0.65")
         lib = list(iter_all_active_features(conn))
         result = match_best(input_vec, lib, threshold=threshold)
 
