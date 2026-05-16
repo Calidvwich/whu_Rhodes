@@ -3,6 +3,7 @@ import math
 import os
 import hashlib
 import importlib
+import sqlite3
 import threading
 import time
 from io import BytesIO
@@ -31,10 +32,10 @@ from src.db.dao import (
     insert_user,
     iter_all_active_features,
     update_config,
-    update_user_info,
     update_user_status,
 )
 from src.feature.matcher import match_best
+from src.feature.vector_codec import encode_feature_vector
 
 DEFAULT_RECOGNITION_THRESHOLD = "0.65"
 
@@ -99,60 +100,108 @@ def get_qss(scale=1.0):
     def s(val): return int(val * scale)
     return f"""
     QMainWindow, QWidget {{
-        background-color: #f5f7fb;
+        background-color: #f6f8fb;
         font-family: "Microsoft YaHei";
-        font-size: {s(15)}px;
+        font-size: {s(14)}px;
+        color: #1f2937;
     }}
     #titleLabel {{
-        font-size: {s(32)}px;
+        font-size: {s(30)}px;
         font-weight: 700;
-        color: #1f2d3d;
+        color: #0f172a;
     }}
     #card {{
-        background: white;
-        border: 1px solid #e6ebf2;
-        border-radius: {s(16)}px;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: {s(10)}px;
     }}
     #subtitle {{
-        font-size: {s(22)}px;
+        font-size: {s(21)}px;
         font-weight: 600;
-        color: #2c3e50;
+        color: #111827;
         margin-bottom: {s(10)}px;
     }}
-    QLineEdit {{
-        min-height: {s(44)}px;
-        border: 1px solid #d7deea;
-        border-radius: {s(8)}px;
-        padding: 0 {s(14)}px;
-        background: #fcfdff;
-        font-size: {s(15)}px;
+    QLineEdit, QComboBox {{
+        min-height: {s(40)}px;
+        border: 1px solid #d1d5db;
+        border-radius: {s(6)}px;
+        padding: 0 {s(12)}px;
+        background: #ffffff;
+        font-size: {s(14)}px;
+        color: #111827;
     }}
-    QLineEdit:focus {{
-        border: 1px solid #4c8bf5;
+    QLineEdit:focus, QComboBox:focus {{
+        border: 1px solid #2563eb;
+        background: #ffffff;
+    }}
+    QComboBox::drop-down {{
+        width: {s(28)}px;
+        border: none;
+    }}
+    QComboBox QAbstractItemView {{
+        background: #ffffff;
+        border: 1px solid #d1d5db;
+        selection-background-color: #e0ecff;
+        selection-color: #111827;
     }}
     QPushButton {{
-        min-height: {s(44)}px;
+        min-height: {s(40)}px;
         border: none;
-        border-radius: {s(8)}px;
-        padding: 0 {s(24)}px;
-        background-color: #4c8bf5;
-        color: white;
-        font-size: {s(16)}px;
+        border-radius: {s(6)}px;
+        padding: 0 {s(18)}px;
+        background-color: #2563eb;
+        color: #ffffff;
+        font-size: {s(14)}px;
         font-weight: 600;
     }}
     QPushButton:hover {{
-        background-color: #3f7ee8;
+        background-color: #1d4ed8;
     }}
     QPushButton:pressed {{
-        background-color: #326fdf;
+        background-color: #1e40af;
+    }}
+    QPushButton:disabled {{
+        background-color: #d1d5db;
+        color: #6b7280;
     }}
     #panelTitle {{
-        font-size: {s(16)}px;
+        font-size: {s(15)}px;
         font-weight: 600;
-        color: #2c3e50;
+        color: #111827;
     }}
     #placeholder {{
-        color: #7f8c9f;
+        color: #94a3b8;
+    }}
+    QListWidget {{
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: {s(6)}px;
+        padding: {s(6)}px;
+        outline: none;
+    }}
+    QListWidget::item {{
+        min-height: {s(34)}px;
+        padding: 0 {s(10)}px;
+        border-radius: {s(5)}px;
+    }}
+    QListWidget::item:hover {{
+        background: #f3f4f6;
+    }}
+    QListWidget::item:selected {{
+        background: #e0ecff;
+        color: #1d4ed8;
+    }}
+    QProgressBar {{
+        min-height: {s(18)}px;
+        border: 1px solid #d1d5db;
+        border-radius: {s(9)}px;
+        background: #f3f4f6;
+        text-align: center;
+        color: #374151;
+    }}
+    QProgressBar::chunk {{
+        border-radius: {s(8)}px;
+        background-color: #2563eb;
     }}
     """
 
@@ -505,6 +554,11 @@ class FaceBusinessService:
                 return True
         return False
 
+    @staticmethod
+    def _optional_text(value):
+        value = (value or "").strip()
+        return value or None
+
     def _seed_demo_users(self):
         if self._username_exists("admin"):
             return
@@ -562,6 +616,9 @@ class FaceBusinessService:
         })
 
     def register(self, username, password, phone, email):
+        username = (username or "").strip()
+        phone = self._optional_text(phone)
+        email = self._optional_text(email)
         if not username or not password:
             return build_response(4020, False, "用户名和密码不能为空", {"user_id": None})
 
@@ -572,6 +629,62 @@ class FaceBusinessService:
         user_id = insert_user(self.conn, username=username, password_hash=password_hash, phone=phone, email=email, role="user")
         self._invalidate_feature_cache()
         return build_response(0, True, "注册成功", {"user_id": user_id})
+
+    def addUserWithFace(self, operator_id, username, password, phone, email, image_file):
+        operator = get_user_by_id(self.conn, operator_id)
+        if not operator or operator.role != "admin" or int(operator.status) != 1:
+            return build_response(4031, False, "管理员权限不足", {"user_id": None, "feature_id": None})
+
+        username = (username or "").strip()
+        phone = self._optional_text(phone)
+        email = self._optional_text(email)
+        if not username or not password:
+            return build_response(4020, False, "用户名和密码不能为空", {"user_id": None, "feature_id": None})
+        if not image_file or not str(image_file).strip():
+            return build_response(4036, False, "新增成员必须选择人脸图片", {"user_id": None, "feature_id": None})
+        if self._username_exists(username) or self._phone_or_email_exists(phone, email):
+            return build_response(4021, False, "账号已存在", {"user_id": None, "feature_id": None})
+
+        image = self._to_image(image_file)
+        if image is None:
+            return build_response(4033, False, "图像格式不合法或路径无效", {"user_id": None, "feature_id": None})
+
+        feat = self.algorithm.process_to_feature_vector(image)
+        if not feat.get("success"):
+            c = int(feat.get("code") or 4035)
+            if c == 4042 or "未检测" in str(feat.get("message", "")):
+                return build_response(4034, False, "未检测到有效人脸，新增成员失败", {"user_id": None, "feature_id": None})
+            return build_response(4035, False, feat.get("message", "特征提取失败"), {"user_id": None, "feature_id": None})
+
+        if np is None:
+            return build_response(5004, False, "未安装 NumPy，无法录入特征", {"user_id": None, "feature_id": None})
+
+        user_id = None
+        try:
+            user_id = insert_user(
+                self.conn,
+                username=username,
+                password_hash=self._hash_password(password),
+                phone=phone,
+                email=email,
+                role="user",
+            )
+            feature_id = insert_face_feature(
+                self.conn,
+                user_id=int(user_id),
+                feature_vector=np.asarray(feat["feature_vector"], dtype=np.float32),
+                image_path=str(image_file),
+            )
+        except Exception as e:
+            if user_id is not None:
+                try:
+                    delete_user_by_username(self.conn, username)
+                except Exception:
+                    pass
+            return build_response(4070, False, f"新增成员失败: {e}", {"user_id": None, "feature_id": None})
+
+        self._invalidate_feature_cache()
+        return build_response(0, True, "新增成员并录入人脸成功", {"user_id": user_id, "feature_id": feature_id})
 
     def addFaceFeature(self, user_id, image_file, operator_id):
         operator = get_user_by_id(self.conn, operator_id)
@@ -699,6 +812,8 @@ class FaceBusinessService:
     def updateUser(self, operator_id, old_username, new_username, new_password, new_photo):
         if not old_username or not new_username:
             return build_response(4060, False, "用户名不能为空", {})
+        if not new_photo or not str(new_photo).strip():
+            return build_response(4065, False, "修改用户必须选择人脸图片", {})
 
         old_user = get_user_by_username(self.conn, old_username)
         if not old_user:
@@ -707,21 +822,51 @@ class FaceBusinessService:
         if new_username != old_username and get_user_by_username(self.conn, new_username):
             return build_response(4061, False, "新用户名已存在", {})
 
+        new_feature_vector = None
+        image = self._to_image(new_photo)
+        if image is None:
+            return build_response(4064, False, "新照片格式不合法或路径无效", {})
+        feat = self.algorithm.process_to_feature_vector(image)
+        if not feat.get("success"):
+            c = int(feat.get("code") or 4035)
+            if c == 4042 or "未检测" in str(feat.get("message", "")):
+                return build_response(4064, False, "新照片未检测到有效人脸，用户信息未修改", {})
+            return build_response(4064, False, f"新照片人脸特征提取失败: {feat.get('message', '特征提取失败')}", {})
+        if np is None:
+            return build_response(5004, False, "未安装 NumPy，无法录入特征", {})
+        new_feature_vector = np.asarray(feat["feature_vector"], dtype=np.float32)
+
         password_hash = self._hash_password(new_password) if new_password else None
-        update_user_info(
-            self.conn,
-            user_id=old_user.user_id,
-            username=new_username,
-            password_hash=password_hash,
-            photo=new_photo or None,
-        )
+        try:
+            self.conn.execute("BEGIN")
+            self.conn.execute(
+                """
+                UPDATE user
+                SET username = ?,
+                    password = COALESCE(?, password),
+                    photo = COALESCE(?, photo)
+                WHERE user_id = ?
+                """,
+                (new_username, password_hash, new_photo or None, int(old_user.user_id)),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO face_feature (user_id, feature_vector, is_active, image_path)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    int(old_user.user_id),
+                    sqlite3.Binary(encode_feature_vector(new_feature_vector)),
+                    1,
+                    new_photo,
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            return build_response(4064, False, f"用户信息修改失败: {e}", {})
+
         self._invalidate_feature_cache()
-        
-        # 补充：如果修改了照片，则需要重新提取特征并录入数据库，否则无法识别人脸
-        if new_photo:
-            face_resp = self.addFaceFeature(old_user.user_id, new_photo, operator_id)
-            if not face_resp["success"]:
-                return build_response(4064, False, f"用户信息已修改，但人脸特征提取失败: {face_resp['message']}", {})
 
         return build_response(0, True, "用户信息修改成功", {})
 
@@ -797,6 +942,10 @@ class FaceSystemUI(QMainWindow):
 
     def go(self, name):
         self.stack.setCurrentWidget(self.pages[name])
+        if name == "add_user":
+            self.clear_add_user_form()
+        elif name == "register":
+            self.clear_register_form()
         if name == "main" and hasattr(self, "camera_panel") and self.camera_panel.last_frame is not None:
             self._queue_realtime_frame(self.camera_panel.last_frame)
         elif name != "main" and hasattr(self, "camera_panel"):
@@ -865,15 +1014,17 @@ class FaceSystemUI(QMainWindow):
                 b.setStyleSheet(
                     """
                     QPushButton#secondary_btn {
-                        background-color: #eef2f9;
-                        color: #334155;
+                        background-color: #ffffff;
+                        color: #374151;
+                        border: 1px solid #d1d5db;
                         font-weight: 600;
                     }
                     QPushButton#secondary_btn:hover {
-                        background-color: #e3e9f4;
+                        background-color: #f9fafb;
+                        border: 1px solid #9ca3af;
                     }
                     QPushButton#secondary_btn:pressed {
-                        background-color: #d8e1f0;
+                        background-color: #f3f4f6;
                     }
                 """
                 )
@@ -882,8 +1033,8 @@ class FaceSystemUI(QMainWindow):
         frame = QFrame()
         frame.setObjectName("card")
         lay = QVBoxLayout(frame)
-        lay.setContentsMargins(16, 12, 16, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(16, 14, 16, 16)
+        lay.setSpacing(12)
 
         t = QLabel(title_text)
         t.setObjectName("panelTitle")
@@ -891,9 +1042,10 @@ class FaceSystemUI(QMainWindow):
 
         box = QFrame()
         box.setStyleSheet(
-            "QFrame { background: #f8faff; border: 1px dashed #cad5e6; border-radius: 10px; }"
+            "QFrame { background: #ffffff; border: 1px solid #eef2f7; border-radius: 8px; }"
         )
         box_lay = QVBoxLayout(box)
+        box_lay.setContentsMargins(12, 12, 12, 12)
 
         if content_widget is not None:
             box_lay.addWidget(content_widget)
@@ -1062,7 +1214,7 @@ class FaceSystemUI(QMainWindow):
         btn_back.setProperty("class", "secondary")
 
         btn_add.clicked.connect(lambda: self.go("add_user"))
-        btn_edit.clicked.connect(lambda: self.go("edit_user"))
+        btn_edit.clicked.connect(self.go_to_edit_blank)
         btn_del.clicked.connect(lambda: self.go("delete_user"))
         btn_back.clicked.connect(lambda: self.go("admin_main"))
 
@@ -1079,7 +1231,7 @@ class FaceSystemUI(QMainWindow):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setSpacing(12)
-        lay.addWidget(self.section_title("新增用户并可选录入人脸"))
+        lay.addWidget(self.section_title("新增用户并录入人脸"))
 
         self.add_user_name = QLineEdit()
         self.add_user_name.setPlaceholderText("用户名")
@@ -1093,7 +1245,7 @@ class FaceSystemUI(QMainWindow):
 
         photo_layout = QHBoxLayout()
         self.add_user_photo = QLineEdit()
-        self.add_user_photo.setPlaceholderText("人脸图片路径（可选）")
+        self.add_user_photo.setPlaceholderText("人脸图片路径（必选）")
         browse_btn = QPushButton("浏览...")
         browse_btn.setProperty("class", "secondary")
         browse_btn.clicked.connect(lambda: self._choose_image(self.add_user_photo))
@@ -1136,7 +1288,7 @@ class FaceSystemUI(QMainWindow):
 
         photo_layout = QHBoxLayout()
         self.edit_photo = QLineEdit()
-        self.edit_photo.setPlaceholderText("新照片路径（可选）")
+        self.edit_photo.setPlaceholderText("新照片路径（必选）")
         browse_edit_btn = QPushButton("浏览...")
         browse_edit_btn.setProperty("class", "secondary")
         browse_edit_btn.clicked.connect(lambda: self._choose_image(self.edit_photo))
@@ -1268,10 +1420,38 @@ class FaceSystemUI(QMainWindow):
         if file_path:
             line_edit.setText(file_path)
 
+    def clear_register_form(self):
+        if not hasattr(self, "reg_user"):
+            return
+        for widget in (self.reg_user, self.reg_pwd, self.reg_phone, self.reg_email):
+            widget.clear()
+
+    def clear_add_user_form(self):
+        if not hasattr(self, "add_user_name"):
+            return
+        for widget in (
+            self.add_user_name,
+            self.add_user_pwd,
+            self.add_user_phone,
+            self.add_user_email,
+            self.add_user_photo,
+        ):
+            widget.clear()
+
+    def clear_edit_user_form(self):
+        if not hasattr(self, "edit_old"):
+            return
+        for widget in (self.edit_old, self.edit_new, self.edit_pwd, self.edit_photo):
+            widget.clear()
+
+    def go_to_edit_blank(self):
+        self.clear_edit_user_form()
+        self.go("edit_user")
+
     def go_to_edit_from_detail(self):
         if hasattr(self, "current_detail_user"):
             self.edit_old.setText(self.current_detail_user["username"])
-            self.edit_new.setText("")
+            self.edit_new.setText(self.current_detail_user["username"])
             self.edit_pwd.setText("")
             self.edit_photo.setText("")
             self.go("edit_user")
@@ -1875,6 +2055,7 @@ class FaceSystemUI(QMainWindow):
             return
 
         self.info(f"{resp['message']}，用户编号: {resp['data']['user_id']}")
+        self.clear_register_form()
         self.go("login")
 
     def do_add_user(self):
@@ -1888,23 +2069,33 @@ class FaceSystemUI(QMainWindow):
         email = self.add_user_email.text().strip()
         photo_path = self.add_user_photo.text().strip()
 
-        reg_resp = self.service.register(username, password, phone, email)
-        if not reg_resp["success"]:
-            self.err(reg_resp["message"])
+        if not photo_path:
+            self.err("新增成员必须选择人脸图片")
+            self.clear_add_user_form()
             return
 
-        user_id = reg_resp["data"]["user_id"]
-        if photo_path:
-            face_resp = self.service.addFaceFeature(user_id, photo_path, self.current_user_id)
-            if not face_resp["success"]:
-                self.err(f"用户已创建，但人脸录入失败: {face_resp['message']}")
-                return
-            self.info(f"新增成功，feature_id={face_resp['data']['feature_id']}")
+        resp = self.service.addUserWithFace(
+            self.current_user_id,
+            username,
+            password,
+            phone,
+            email,
+            photo_path,
+        )
+        self.clear_add_user_form()
+        if not resp["success"]:
+            self.err(resp["message"])
             return
 
-        self.info(f"新增用户成功，user_id={user_id}")
+        data = resp["data"]
+        self.info(f"新增成功，user_id={data['user_id']}，feature_id={data['feature_id']}")
 
     def do_edit_user(self):
+        if not self.edit_photo.text().strip():
+            self.err("修改用户必须选择人脸图片")
+            self.clear_edit_user_form()
+            return
+
         resp = self.service.updateUser(
             self.current_user_id,
             self.edit_old.text().strip(),
@@ -1912,8 +2103,10 @@ class FaceSystemUI(QMainWindow):
             self.edit_pwd.text().strip(),
             self.edit_photo.text().strip(),
         )
+        self.clear_edit_user_form()
         if resp["success"]:
             self.info(resp["message"])
+            self.go_to_user_list()
         else:
             self.err(resp["message"])
 

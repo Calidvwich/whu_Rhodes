@@ -30,6 +30,13 @@ def prepare_qt_runtime() -> None:
     Force Qt to prefer the PyQt5 plugin tree instead of OpenCV's vendored Qt
     plugins, and prefer Wayland when the desktop session is already Wayland.
     """
+    current_rules = os.environ.get("QT_LOGGING_RULES", "")
+    quiet_rules = "qt.qpa.fonts.warning=false"
+    if quiet_rules not in current_rules:
+        os.environ["QT_LOGGING_RULES"] = (
+            f"{current_rules};{quiet_rules}" if current_rules else quiet_rules
+        )
+
     if not sys.platform.startswith("linux"):
         return
 

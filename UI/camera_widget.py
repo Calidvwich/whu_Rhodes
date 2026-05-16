@@ -13,6 +13,8 @@ from PyQt5.QtCore import QRect, QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QLabel, QMessageBox, QVBoxLayout, QWidget
 
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+
 
 def _optional_import(module_name):
     try:
@@ -22,6 +24,18 @@ def _optional_import(module_name):
 
 
 cv2 = _optional_import("cv2")
+
+
+def _configure_opencv_logging():
+    if cv2 is None:
+        return
+    try:
+        cv2.setLogLevel(0)
+    except Exception:
+        pass
+
+
+_configure_opencv_logging()
 
 
 class _ClosedCapture:
@@ -219,6 +233,16 @@ class CameraPanel(QWidget):
         self.label = QLabel("等待摄像头...")
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setMinimumSize(640, 360)
+        self.label.setStyleSheet(
+            """
+            QLabel {
+                background: #0f172a;
+                color: #cbd5e1;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+            }
+            """
+        )
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.label)
