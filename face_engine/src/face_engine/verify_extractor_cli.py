@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--model-cache", default=None, help="optional path used as TORCH_HOME cache")
     p.add_argument("--no-l2", action="store_true", help="disable L2 normalization on vectors")
-    p.add_argument("--auto-align", action="store_true", help="align faces with MTCNN before extracting")
+    p.add_argument("--auto-align", action="store_true", help="align faces with RetinaFace before extracting")
     p.add_argument("--no-auto-align", action="store_true", help="skip auto align and use image as-is")
     p.set_defaults(func=cmd_verify)
     return p

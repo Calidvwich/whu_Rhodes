@@ -19,8 +19,9 @@ pip install -r face_engine/requirements.txt
 ```
 
 说明：
-- FaceNet / MTCNN 代码来自仓库内的 `facenet_pytorch` git submodule
-- 不再单独安装 `facenet-pytorch` pip 包
+- FaceNet 代码来自仓库内的 `facenet_pytorch` git submodule
+- 人脸检测与关键点定位改用仓库内置的纯 `PyTorch RetinaFace`
+- 首次使用 RetinaFace 可能联网下载模型权重；若离线环境缺少权重，将无法完成检测
 
 ## 2. 预处理模块
 
@@ -43,7 +44,7 @@ python face_engine/scripts/preprocess_face.py batch \
 ```
 
 说明：
-- 使用仓库内 `facenet_pytorch` submodule 的 `MTCNN`
+- 使用纯 `PyTorch RetinaFace` 做人脸检测和 5 点关键点定位
 - 检测到多张人脸时，默认选择面积最大的那一张
 - 基于 5 点关键点做相似变换对齐，不是仅按框裁剪
 - 输出固定为 `RGB` 对齐人脸图，默认尺寸 `160x160`
@@ -93,6 +94,12 @@ python face_engine/scripts/verify_extractor.py \
   --manifest face_engine/examples/face_samples_manifest.example.json \
   --out-dir face_engine/examples/verify_vectors_local
 ```
+
+如果首次运行预处理时报错，请先确认：
+
+- 已安装 `face_engine/requirements.txt` 中的 `torch`、`torchvision` 等依赖
+- 当前环境允许 RetinaFace 首次下载模型权重
+- 如离线运行，需要预先准备 RetinaFace 所需权重缓存
 
 ## 5. Python 调用方式
 

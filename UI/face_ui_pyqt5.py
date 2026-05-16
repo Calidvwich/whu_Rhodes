@@ -93,6 +93,7 @@ cv2 = _optional_import("cv2")
 np = _optional_import("numpy")
 bcrypt_mod = _optional_import("bcrypt")
 qrcode_mod = _optional_import("qrcode")
+torch_mod = _optional_import("torch")
 
 
 # ========= 全局样式 =========
@@ -220,6 +221,33 @@ def build_response(code, success, message, data=None):
 # ========= 算法层（对接仓库内 face_engine）=========
 FACE_ENGINE_SRC = PROJECT_ROOT / "face_engine" / "src"
 FACE_ENGINE_MODEL_CACHE = PROJECT_ROOT / "face_engine" / ".model_cache"
+REALTIME_DETECTOR_MAX_SIZE_GPU = 512
+REALTIME_DETECTOR_MAX_SIZE_CPU = 384
+REALTIME_FRAME_MAX_SIDE_GPU = 960
+REALTIME_FRAME_MAX_SIDE_CPU = 640
+
+
+def resize_frame_for_realtime(frame, max_side):
+    if np is None:
+        raise RuntimeError("未安装 NumPy")
+
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise RuntimeError(f"图像维度无效: {arr.shape}")
+
+    height, width = arr.shape[:2]
+    longest_side = max(height, width)
+    limit = int(max_side)
+    if limit <= 0 or longest_side <= limit or cv2 is None:
+        return arr.copy(), 1.0, 1.0
+
+    scale = float(limit) / float(longest_side)
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(arr, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    scale_x = float(width) / float(resized_width)
+    scale_y = float(height) / float(resized_height)
+    return resized, scale_x, scale_y
 
 
 class FaceAlgorithm:
@@ -234,6 +262,19 @@ class FaceAlgorithm:
         self._preprocess_faces = None
         self._extract_from_aligned_face = None
         self._inference_lock = threading.Lock()
+
+    def _runtime_device(self) -> str:
+        if self._device in {"cpu", "cuda"}:
+            return self._device
+        if torch_mod is None:
+            return "cpu"
+        return "cuda" if torch_mod.cuda.is_available() else "cpu"
+
+    def _realtime_detector_max_size(self) -> int:
+        return REALTIME_DETECTOR_MAX_SIZE_GPU if self._runtime_device() == "cuda" else REALTIME_DETECTOR_MAX_SIZE_CPU
+
+    def _realtime_frame_max_side(self) -> int:
+        return REALTIME_FRAME_MAX_SIDE_GPU if self._runtime_device() == "cuda" else REALTIME_FRAME_MAX_SIDE_CPU
 
     def _ensure_face_engine(self) -> None:
         if self._preprocess_face_image is not None and self._preprocess_faces is not None:
@@ -298,7 +339,10 @@ class FaceAlgorithm:
 
         try:
             with self._inference_lock:
-                aligned = self._preprocess_face_image(rgb, device=self._device)
+                aligned = self._preprocess_face_image(
+                    rgb,
+                    device=self._device,
+                )
         except RuntimeError as e:
             err = str(e).lower()
             if "no face" in err or "confidence" in err or "below threshold" in err:
@@ -329,7 +373,11 @@ class FaceAlgorithm:
         try:
             with self._inference_lock:
                 self._ensure_face_engine()
-                preprocessed_faces = self._preprocess_faces(rgb, device=self._device)
+                preprocessed_faces = self._preprocess_faces(
+                    rgb,
+                    device=self._device,
+                    detector_max_size=self._realtime_detector_max_size(),
+                )
         except RuntimeError as e:
             err = str(e).lower()
             if "no face" in err or "confidence" in err or "below threshold" in err:
@@ -384,11 +432,21 @@ class FaceAlgorithm:
             self._ensure_face_engine()
 
         dummy = np.zeros((160, 160, 3), dtype=np.uint8)
+        detector_max_size = self._realtime_detector_max_size()
+        warmup_shapes = [
+            (max(1, int(round(detector_max_size * 3 / 4))), detector_max_size),
+            (max(1, int(round(detector_max_size * 9 / 16))), detector_max_size),
+        ]
 
         report(35, "加载人脸检测模型")
         try:
             with self._inference_lock:
-                self._preprocess_faces(dummy, device=self._device)
+                for height, width in warmup_shapes:
+                    self._preprocess_faces(
+                        np.zeros((height, width, 3), dtype=np.uint8),
+                        device=self._device,
+                        detector_max_size=detector_max_size,
+                    )
         except RuntimeError as e:
             if "no face" not in str(e).lower():
                 raise
@@ -408,13 +466,14 @@ class FaceAlgorithm:
 class RealtimeRecognitionWorker(QThread):
     result_ready = pyqtSignal(object)
 
-    def __init__(self, algorithm, frame, context, device_info, generation, parent=None):
+    def __init__(self, algorithm, frame, context, device_info, generation, box_scale=(1.0, 1.0), parent=None):
         super().__init__(parent)
         self.algorithm = algorithm
         self.frame = frame
         self.context = context
         self.device_info = device_info
         self.generation = generation
+        self.box_scale = box_scale
 
     def run(self):
         started = time.perf_counter()
@@ -427,6 +486,18 @@ class RealtimeRecognitionWorker(QThread):
             )
         except Exception as e:
             result = {"success": False, "message": str(e), "code": 5006, "faces": []}
+
+        scale_x, scale_y = self.box_scale
+        if (scale_x != 1.0 or scale_y != 1.0) and result.get("faces"):
+            for face in result["faces"]:
+                box = face.get("box") or []
+                if len(box) >= 4:
+                    face["box"] = [
+                        float(box[0]) * scale_x,
+                        float(box[1]) * scale_y,
+                        float(box[2]) * scale_x,
+                        float(box[3]) * scale_y,
+                    ]
 
         elapsed = max(time.perf_counter() - started, 1e-6)
         result["device_info"] = self.device_info
@@ -913,6 +984,7 @@ class FaceSystemUI(QMainWindow):
         self.pending_after_init_page = None
         self.realtime_worker = None
         self.realtime_pending_frame = None
+        self.realtime_pending_scale = (1.0, 1.0)
         self.realtime_pending_device_info = ""
         self.realtime_generation = 0
         self.realtime_closing = False
@@ -1127,7 +1199,7 @@ class FaceSystemUI(QMainWindow):
         self.init_progress_bar.setMinimumHeight(32)
         lay.addWidget(self.init_progress_bar)
 
-        hint = QLabel("首次加载 MTCNN / FaceNet 需要几秒，请稍候。")
+        hint = QLabel("首次加载 RetinaFace / FaceNet 需要几秒，请稍候。")
         hint.setAlignment(Qt.AlignCenter)
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #64748b; font-size: 12px;")
@@ -1642,7 +1714,18 @@ class FaceSystemUI(QMainWindow):
                 self.processing_hint.setText("处理: NumPy 不可用")
             return
 
-        self.realtime_pending_frame = frame.copy()
+        try:
+            prepared_frame, scale_x, scale_y = resize_frame_for_realtime(
+                frame,
+                self.service.algorithm._realtime_frame_max_side(),
+            )
+        except Exception as e:
+            if hasattr(self, "processing_hint"):
+                self.processing_hint.setText(f"处理: 缩放失败 {e}")
+            return
+
+        self.realtime_pending_frame = prepared_frame
+        self.realtime_pending_scale = (scale_x, scale_y)
         self.realtime_pending_device_info = self.camera_panel.selected_device_info()
         if self.realtime_worker is None or not self.realtime_worker.isRunning():
             self._start_realtime_worker()
@@ -1654,8 +1737,10 @@ class FaceSystemUI(QMainWindow):
             return
 
         frame = self.realtime_pending_frame
+        box_scale = self.realtime_pending_scale
         device_info = self.realtime_pending_device_info or self.camera_panel.selected_device_info()
         self.realtime_pending_frame = None
+        self.realtime_pending_scale = (1.0, 1.0)
         self.realtime_pending_device_info = ""
 
         try:
@@ -1671,7 +1756,8 @@ class FaceSystemUI(QMainWindow):
             context,
             device_info,
             self.realtime_generation,
-            self,
+            box_scale=box_scale,
+            parent=self,
         )
         self.realtime_worker = worker
         worker.result_ready.connect(self.on_realtime_result)
@@ -1689,7 +1775,8 @@ class FaceSystemUI(QMainWindow):
             self.service.recordRealtimeMatches(faces, result.get("device_info"))
             fps = float(result.get("processing_fps") or 0.0)
             if hasattr(self, "processing_hint"):
-                self.processing_hint.setText(f"处理: {fps:.1f} FPS  人脸: {len(faces)}")
+                device = self.service.algorithm._runtime_device().upper()
+                self.processing_hint.setText(f"处理: {fps:.1f} FPS  人脸: {len(faces)}  设备: {device}")
             return
 
         self.camera_panel.set_face_annotations([])
@@ -1707,6 +1794,7 @@ class FaceSystemUI(QMainWindow):
     def _clear_realtime_view(self):
         self.realtime_generation += 1
         self.realtime_pending_frame = None
+        self.realtime_pending_scale = (1.0, 1.0)
         self.realtime_pending_device_info = ""
         if hasattr(self, "camera_panel"):
             self.camera_panel.set_face_annotations([])

@@ -37,7 +37,8 @@ git submodule update --remote
 
 ### `face_engine/`
 
-- 使用仓库内 `facenet_pytorch` submodule 提供的 FaceNet / MTCNN
+- 使用仓库内 `facenet_pytorch` submodule 提供的 FaceNet
+- 人脸检测与关键点定位使用纯 PyTorch RetinaFace
 - 提供 Python 接口与 CLI：
   - `python face_engine/scripts/preprocess_face.py single ...`
   - `python face_engine/scripts/extract_feature.py single ...`
@@ -57,7 +58,7 @@ git submodule update --remote
 当前主链路已经按 `UI -> face_engine -> database -> UI` 跑通：
 
 1. `UI/face_ui_pyqt5.py` 采集或读取图像。
-2. `face_engine/` 使用 MTCNN 做人脸检测与对齐，并用 FaceNet 提取 `512` 维特征向量。
+2. `face_engine/` 使用 RetinaFace 做人脸检测与 5 点对齐，并用 FaceNet 提取 `512` 维特征向量。
 3. `database/` 将特征向量写入 SQLite，或与特征库做余弦相似度比对并写识别日志。
 4. UI 根据业务接口返回的 `code / success / message / data / timestamp` 展示结果。
 
@@ -77,7 +78,7 @@ conda run -n whu_rhodes_ui python -m pip install -r face_engine/requirements.txt
 conda run -n whu_rhodes_ui python database/scripts/init_db.py
 ```
 
-首次运行算法层时会自动下载 FaceNet 预训练权重。权重缓存目录固定为 `face_engine/.model_cache/`，该目录已被 `.gitignore` 忽略，不要提交到仓库。可先用示例图验证特征提取：
+首次运行算法层时会自动下载 FaceNet 预训练权重；PyTorch RetinaFace 也可能在首次检测时下载模型权重。`face_engine/.model_cache/` 用于当前仓库内的模型缓存。离线环境如果没有现成权重，预处理会直接报错而不是退化运行。可先用示例图验证特征提取：
 
 ```powershell
 conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str((Path('face_engine') / 'src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(Path('face_engine') / 'examples' / 'aligned_face.png', model_cache=Path('face_engine') / '.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
