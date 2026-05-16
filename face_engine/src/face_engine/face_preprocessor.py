@@ -133,6 +133,11 @@ class FacePreprocessor:
         )
 
     def detect_largest_face(self, image: ImageLike) -> tuple[Image.Image, FaceDetection]:
+        pil_image, candidates = self.detect_faces(image)
+        target = max(candidates, key=lambda d: d.area)
+        return pil_image, target
+
+    def detect_faces(self, image: ImageLike) -> tuple[Image.Image, list[FaceDetection]]:
         pil_image = _to_pil_rgb(image)
         boxes, probs, points = self.mtcnn.detect(pil_image, landmarks=True)
         if boxes is None or probs is None or points is None or len(boxes) == 0:
@@ -166,8 +171,8 @@ class FacePreprocessor:
                 f"best={best.probability:.4f}, required>={self.min_confidence:.4f}"
             )
 
-        target = max(candidates, key=lambda d: d.area)
-        return pil_image, target
+        candidates.sort(key=lambda d: (float(d.box[1]), float(d.box[0])))
+        return pil_image, candidates
 
     def preprocess(self, image: ImageLike) -> PreprocessResult:
         pil_image, target = self.detect_largest_face(image)
@@ -178,6 +183,21 @@ class FacePreprocessor:
             landmarks=target.landmarks.copy(),
             probability=target.probability,
         )
+
+    def preprocess_all(self, image: ImageLike) -> list[PreprocessResult]:
+        pil_image, targets = self.detect_faces(image)
+        results: list[PreprocessResult] = []
+        for target in targets:
+            aligned = _warp_face(pil_image, target.landmarks, self.output_size).convert("RGB")
+            results.append(
+                PreprocessResult(
+                    image=aligned,
+                    box=target.box.copy(),
+                    landmarks=target.landmarks.copy(),
+                    probability=target.probability,
+                )
+            )
+        return results
 
 
 def get_preprocessor(
@@ -227,6 +247,21 @@ def preprocess_face(
         min_confidence=min_confidence,
     )
     return preprocessor.preprocess(image)
+
+
+def preprocess_faces(
+    image: ImageLike,
+    *,
+    device: str | None = None,
+    output_size: int = DEFAULT_OUTPUT_SIZE,
+    min_confidence: float = 0.0,
+) -> list[PreprocessResult]:
+    preprocessor = get_preprocessor(
+        device=device,
+        output_size=output_size,
+        min_confidence=min_confidence,
+    )
+    return preprocessor.preprocess_all(image)
 
 
 def save_preprocessed_face(image: Image.Image, out_path: str | Path) -> None:

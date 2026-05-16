@@ -3,6 +3,8 @@ import math
 import os
 import hashlib
 import importlib
+import threading
+import time
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +50,7 @@ def get_db_conn():
         conn.commit()
     return conn
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -64,6 +66,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -175,10 +178,12 @@ class FaceAlgorithm:
     def __init__(self, *, device: str | None = None) -> None:
         self._device = device
         self._preprocess_face_image = None
+        self._preprocess_faces = None
         self._extract_from_aligned_face = None
+        self._inference_lock = threading.Lock()
 
     def _ensure_face_engine(self) -> None:
-        if self._preprocess_face_image is not None:
+        if self._preprocess_face_image is not None and self._preprocess_faces is not None:
             return
         src = FACE_ENGINE_SRC
         if not src.is_dir():
@@ -187,13 +192,14 @@ class FaceAlgorithm:
         if p not in sys.path:
             sys.path.insert(0, p)
         try:
-            from face_engine import extract_from_aligned_face, preprocess_face_image
+            from face_engine import extract_from_aligned_face, preprocess_face_image, preprocess_faces
         except ImportError as e:
             raise ImportError(
                 "无法加载 face_engine（通常缺少 torch 等依赖）。"
                 "请在 UI 的 venv 中执行: pip install -r ../face_engine/requirements.txt"
             ) from e
         self._preprocess_face_image = preprocess_face_image
+        self._preprocess_faces = preprocess_faces
         self._extract_from_aligned_face = extract_from_aligned_face
 
     @staticmethod
@@ -227,7 +233,8 @@ class FaceAlgorithm:
         if image is None:
             return {"success": False, "message": "图像为空", "code": 4041}
         try:
-            self._ensure_face_engine()
+            with self._inference_lock:
+                self._ensure_face_engine()
         except Exception as e:
             return {"success": False, "message": str(e), "code": 5005}
 
@@ -237,7 +244,8 @@ class FaceAlgorithm:
             return {"success": False, "message": str(e), "code": 4033}
 
         try:
-            aligned = self._preprocess_face_image(rgb, device=self._device)
+            with self._inference_lock:
+                aligned = self._preprocess_face_image(rgb, device=self._device)
         except RuntimeError as e:
             err = str(e).lower()
             if "no face" in err or "confidence" in err or "below threshold" in err:
@@ -245,16 +253,151 @@ class FaceAlgorithm:
             return {"success": False, "message": str(e), "code": 4042}
 
         try:
-            vec = self._extract_from_aligned_face(
-                aligned,
-                l2_normalize_output=True,
-                device=self._device,
-                model_cache=FACE_ENGINE_MODEL_CACHE,
-            )
+            with self._inference_lock:
+                vec = self._extract_from_aligned_face(
+                    aligned,
+                    l2_normalize_output=True,
+                    device=self._device,
+                    model_cache=FACE_ENGINE_MODEL_CACHE,
+                )
         except Exception as e:
             return {"success": False, "message": str(e), "code": 4043}
 
         return {"success": True, "feature_vector": vec, "code": 0}
+
+    def recognize_faces_in_frame(self, image, library, user_names, threshold) -> dict:
+        if image is None:
+            return {"success": False, "message": "图像为空", "code": 4041, "faces": []}
+        try:
+            rgb = self._to_rgb_numpy(image)
+        except Exception as e:
+            return {"success": False, "message": str(e), "code": 4033, "faces": []}
+
+        try:
+            with self._inference_lock:
+                self._ensure_face_engine()
+                preprocessed_faces = self._preprocess_faces(rgb, device=self._device)
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "no face" in err or "confidence" in err or "below threshold" in err:
+                return {"success": True, "message": "未检测到人脸", "code": 0, "faces": []}
+            return {"success": False, "message": str(e), "code": 4042, "faces": []}
+        except Exception as e:
+            return {"success": False, "message": str(e), "code": 5005, "faces": []}
+
+        faces = []
+        feature_library = list(library or [])
+        for face in preprocessed_faces:
+            try:
+                with self._inference_lock:
+                    vec = self._extract_from_aligned_face(
+                        face.image,
+                        l2_normalize_output=True,
+                        device=self._device,
+                        model_cache=FACE_ENGINE_MODEL_CACHE,
+                    )
+                feature_vector = np.asarray(vec, dtype=np.float32) if np is not None else vec
+                match = match_best(feature_vector, feature_library, threshold=threshold)
+                similarity = float(match.max_similarity)
+                if similarity < 0.0:
+                    similarity = 0.0
+                matched_user_id = match.matched_user_id if match.matched else None
+                username = user_names.get(matched_user_id) if matched_user_id is not None else None
+                faces.append(
+                    {
+                        "box": [float(v) for v in face.box.tolist()],
+                        "username": username or "陌生人",
+                        "similarity": similarity,
+                        "matched": bool(match.matched),
+                        "user_id": matched_user_id,
+                        "detection_confidence": float(face.probability),
+                    }
+                )
+            except Exception:
+                continue
+
+        return {"success": True, "message": "识别完成", "code": 0, "faces": faces}
+
+    def initialize_models(self, progress_callback=None) -> None:
+        def report(value, message):
+            if progress_callback:
+                progress_callback(int(value), message)
+
+        if np is None:
+            raise RuntimeError("未安装 NumPy，无法初始化识别模型")
+
+        report(8, "准备算法模块")
+        with self._inference_lock:
+            self._ensure_face_engine()
+
+        dummy = np.zeros((160, 160, 3), dtype=np.uint8)
+
+        report(35, "加载人脸检测模型")
+        try:
+            with self._inference_lock:
+                self._preprocess_faces(dummy, device=self._device)
+        except RuntimeError as e:
+            if "no face" not in str(e).lower():
+                raise
+
+        report(72, "加载特征提取模型")
+        with self._inference_lock:
+            self._extract_from_aligned_face(
+                dummy,
+                l2_normalize_output=True,
+                device=self._device,
+                model_cache=FACE_ENGINE_MODEL_CACHE,
+            )
+
+        report(100, "初始化完成")
+
+
+class RealtimeRecognitionWorker(QThread):
+    result_ready = pyqtSignal(object)
+
+    def __init__(self, algorithm, frame, context, device_info, generation, parent=None):
+        super().__init__(parent)
+        self.algorithm = algorithm
+        self.frame = frame
+        self.context = context
+        self.device_info = device_info
+        self.generation = generation
+
+    def run(self):
+        started = time.perf_counter()
+        try:
+            result = self.algorithm.recognize_faces_in_frame(
+                self.frame,
+                self.context.get("library", []),
+                self.context.get("user_names", {}),
+                self.context.get("threshold", float(DEFAULT_RECOGNITION_THRESHOLD)),
+            )
+        except Exception as e:
+            result = {"success": False, "message": str(e), "code": 5006, "faces": []}
+
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        result["device_info"] = self.device_info
+        result["generation"] = self.generation
+        result["processing_fps"] = 1.0 / elapsed
+        self.result_ready.emit(result)
+
+
+class ModelInitializationWorker(QThread):
+    progress_changed = pyqtSignal(int, str)
+    init_finished = pyqtSignal(bool, str)
+
+    def __init__(self, algorithm, parent=None):
+        super().__init__(parent)
+        self.algorithm = algorithm
+
+    def run(self):
+        try:
+            self.algorithm.initialize_models(
+                lambda value, message: self.progress_changed.emit(value, message)
+            )
+            self.init_finished.emit(True, "初始化完成")
+        except Exception as e:
+            self.init_finished.emit(False, str(e))
 
 
 # ========= 业务逻辑层 =========
@@ -262,6 +405,10 @@ class FaceBusinessService:
     def __init__(self):
         self.conn = get_db_conn()
         self.algorithm = FaceAlgorithm()
+        self._feature_cache = None
+        self._user_name_cache = None
+        self._last_realtime_log = {}
+        self._realtime_log_cooldown = 5.0
         self._seed_demo_users()
 
     def close(self):
@@ -294,6 +441,51 @@ class FaceBusinessService:
             "status": row.status,
             "role": row.role,
         }
+
+    def _invalidate_feature_cache(self):
+        self._feature_cache = None
+        self._user_name_cache = None
+
+    def getRealtimeRecognitionContext(self):
+        threshold = float(
+            get_config_by_key(self.conn, "threshold")
+            or get_config_by_key(self.conn, "recognition_threshold")
+            or DEFAULT_RECOGNITION_THRESHOLD
+        )
+        if self._feature_cache is None:
+            self._feature_cache = list(iter_all_active_features(self.conn))
+        if self._user_name_cache is None:
+            self._user_name_cache = {u.user_id: u.username for u in get_all_users(self.conn)}
+        return {
+            "threshold": threshold,
+            "library": list(self._feature_cache),
+            "user_names": dict(self._user_name_cache),
+        }
+
+    def recordRealtimeMatches(self, faces, device_info):
+        now = time.monotonic()
+        wrote = 0
+        for face in faces or []:
+            if not face.get("matched"):
+                continue
+            user_id = face.get("user_id")
+            if user_id is None:
+                continue
+            key = (int(user_id), str(device_info or ""))
+            last_at = self._last_realtime_log.get(key, 0.0)
+            if now - last_at < self._realtime_log_cooldown:
+                continue
+            insert_recognition_log(
+                self.conn,
+                user_id=int(user_id),
+                input_image_url="memory_frame",
+                similarity=float(face.get("similarity") or 0.0),
+                result=1,
+                device_info=device_info,
+            )
+            self._last_realtime_log[key] = now
+            wrote += 1
+        return wrote
 
     def _username_exists(self, username):
         return get_user_by_username(self.conn, username) is not None
@@ -374,6 +566,7 @@ class FaceBusinessService:
 
         password_hash = self._hash_password(password)
         user_id = insert_user(self.conn, username=username, password_hash=password_hash, phone=phone, email=email, role="user")
+        self._invalidate_feature_cache()
         return build_response(0, True, "注册成功", {"user_id": user_id})
 
     def addFaceFeature(self, user_id, image_file, operator_id):
@@ -406,6 +599,7 @@ class FaceBusinessService:
             feature_vector=np.asarray(feat["feature_vector"], dtype=np.float32),
             image_path=image_path,
         )
+        self._invalidate_feature_cache()
         return build_response(0, True, "录入成功", {"feature_id": feature_id})
 
     def recognizeFace(self, image_data, device_info, request_time):
@@ -495,6 +689,7 @@ class FaceBusinessService:
             return build_response(4053, False, "目标用户不存在", {})
             
         update_user_status(self.conn, user_id=target_user.user_id, status=status)
+        self._invalidate_feature_cache()
         return build_response(0, True, "状态更新成功", {})
 
     def updateUser(self, operator_id, old_username, new_username, new_password, new_photo):
@@ -516,6 +711,7 @@ class FaceBusinessService:
             password_hash=password_hash,
             photo=new_photo or None,
         )
+        self._invalidate_feature_cache()
         
         # 补充：如果修改了照片，则需要重新提取特征并录入数据库，否则无法识别人脸
         if new_photo:
@@ -532,6 +728,7 @@ class FaceBusinessService:
         if target.role == "admin":
             return build_response(4063, False, "管理员账号不可删除", {})
         delete_user_by_username(self.conn, username)
+        self._invalidate_feature_cache()
         return build_response(0, True, "删除用户成功", {})
 
     @staticmethod
@@ -562,6 +759,14 @@ class FaceSystemUI(QMainWindow):
         self.mobile_scan_dialog = None
         self.mobile_scan_qr_label = None
         self.mobile_scan_url_label = None
+        self.initialization_thread = None
+        self.model_initialized = False
+        self.pending_after_init_page = None
+        self.realtime_worker = None
+        self.realtime_pending_frame = None
+        self.realtime_pending_device_info = ""
+        self.realtime_generation = 0
+        self.realtime_closing = False
         self.mobile_frame_received.connect(self.on_mobile_frame_received)
 
         self.stack = QStackedWidget()
@@ -570,6 +775,7 @@ class FaceSystemUI(QMainWindow):
         self.pages = {}
         self.pages["start"] = self.create_start_page()
         self.pages["login"] = self.create_login_page()
+        self.pages["initializing"] = self.create_initializing_page()
         self.pages["register"] = self.create_register_page()
         self.pages["admin_main"] = self.create_admin_main_page()
         self.pages["maintain"] = self.create_maintain_page()
@@ -587,6 +793,10 @@ class FaceSystemUI(QMainWindow):
 
     def go(self, name):
         self.stack.setCurrentWidget(self.pages[name])
+        if name == "main" and hasattr(self, "camera_panel") and self.camera_panel.last_frame is not None:
+            self._queue_realtime_frame(self.camera_panel.last_frame)
+        elif name != "main" and hasattr(self, "camera_panel"):
+            self._clear_realtime_view()
 
     def wrap_center(self, inner_widget, base_width=460):
         # 记录基础宽度以便 resizeEvent 等比缩放
@@ -738,6 +948,42 @@ class FaceSystemUI(QMainWindow):
         lay.addLayout(row)
 
         page = self.wrap_center(body, 440)
+        self._refresh_secondary_style(page)
+        return page
+
+    def create_initializing_page(self):
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setSpacing(16)
+        lay.addWidget(self.section_title("初始化识别模型"))
+
+        self.init_status_label = QLabel("正在准备...")
+        self.init_status_label.setAlignment(Qt.AlignCenter)
+        self.init_status_label.setWordWrap(True)
+        self.init_status_label.setStyleSheet("color: #334155;")
+        lay.addWidget(self.init_status_label)
+
+        self.init_progress_bar = QProgressBar()
+        self.init_progress_bar.setRange(0, 100)
+        self.init_progress_bar.setValue(0)
+        self.init_progress_bar.setTextVisible(True)
+        self.init_progress_bar.setFormat("%p%")
+        self.init_progress_bar.setMinimumHeight(32)
+        lay.addWidget(self.init_progress_bar)
+
+        hint = QLabel("首次加载 MTCNN / FaceNet 需要几秒，请稍候。")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #64748b; font-size: 12px;")
+        lay.addWidget(hint)
+
+        self.init_retry_btn = QPushButton("重试初始化")
+        self.init_retry_btn.setProperty("class", "secondary")
+        self.init_retry_btn.clicked.connect(lambda: self.start_model_initialization(self.pending_after_init_page))
+        self.init_retry_btn.hide()
+        lay.addWidget(self.init_retry_btn)
+
+        page = self.wrap_center(body, 520)
         self._refresh_secondary_style(page)
         return page
 
@@ -1058,13 +1304,17 @@ class FaceSystemUI(QMainWindow):
         self.result_id = QLabel("用户ID: -")
         self.result_similarity = QLabel("相似度: -")
         self.result_status = QLabel("结果: -")
-        btn_recognize = QPushButton("执行识别")
-        btn_recognize.clicked.connect(self.do_recognize)
+        for result_label in (
+            self.result_user,
+            self.result_id,
+            self.result_similarity,
+            self.result_status,
+        ):
+            result_label.setWordWrap(True)
         result_layout.addWidget(self.result_user)
         result_layout.addWidget(self.result_id)
         result_layout.addWidget(self.result_similarity)
         result_layout.addWidget(self.result_status)
-        result_layout.addWidget(btn_recognize)
         result_panel = self.make_panel("识别结果反馈区", content_widget=result_content)
 
         top.addWidget(video_panel, 0, 0)
@@ -1104,8 +1354,10 @@ class FaceSystemUI(QMainWindow):
         match_content = QWidget()
         match_layout = QVBoxLayout(match_content)
         self.match_desc = QLabel("识别阈值: 0.65")
+        self.processing_hint = QLabel("处理: -")
         self.log_hint = QLabel("日志: 自动记录 device_info")
         match_layout.addWidget(self.match_desc)
+        match_layout.addWidget(self.processing_hint)
         match_layout.addWidget(self.log_hint)
         match_info = self.make_panel("匹配结果展示区", content_widget=match_content)
 
@@ -1128,16 +1380,203 @@ class FaceSystemUI(QMainWindow):
         return root
 
     def on_frame_captured(self, _frame):
+        if not hasattr(self, "cam_status"):
+            return
         self.cam_status.setText("状态: 已连接")
         device_info = self.camera_panel.selected_device_info()
         if device_info.startswith("camera:"):
             camera_id = self.camera_panel.selected_camera_id()
             self._ensure_camera_option(camera_id)
         self.cam_info.setText(f"设备: {device_info}")
+        self._queue_realtime_frame(_frame)
 
     def on_camera_error(self, msg, camera_id):
+        if not hasattr(self, "cam_status"):
+            return
+        self._clear_realtime_view()
         self.cam_status.setText("状态: 连接失败")
         self.cam_info.setText(f"设备: camera:{camera_id}  {msg}")
+
+    def start_model_initialization(self, target_page=None):
+        self.pending_after_init_page = target_page or self.pending_after_init_page or "main"
+        if self.model_initialized:
+            self.go(self.pending_after_init_page)
+            return
+        if self.initialization_thread is not None and self.initialization_thread.isRunning():
+            self.go("initializing")
+            return
+
+        self.init_progress_bar.setValue(0)
+        self.init_progress_bar.setFormat("%p%")
+        self.init_status_label.setText("正在准备初始化...")
+        self.init_retry_btn.hide()
+        self.go("initializing")
+
+        worker = ModelInitializationWorker(self.service.algorithm, self)
+        self.initialization_thread = worker
+        worker.progress_changed.connect(self.on_model_init_progress)
+        worker.init_finished.connect(self.on_model_init_finished)
+        worker.finished.connect(self.on_model_init_thread_finished)
+        worker.start()
+
+    def on_model_init_progress(self, value, message):
+        self.init_progress_bar.setValue(max(0, min(100, int(value))))
+        self.init_status_label.setText(message)
+
+    def on_model_init_finished(self, success, message):
+        if success:
+            self.model_initialized = True
+            self.init_progress_bar.setValue(100)
+            self.init_status_label.setText("初始化完成，正在进入系统...")
+            self.go(self.pending_after_init_page or "main")
+            return
+
+        self.model_initialized = False
+        self.init_status_label.setText(f"初始化失败: {message}")
+        self.init_progress_bar.setFormat("失败")
+        self.init_retry_btn.show()
+
+    def on_model_init_thread_finished(self):
+        self.initialization_thread = None
+
+    def _realtime_page_active(self):
+        return (
+            hasattr(self, "stack")
+            and hasattr(self, "pages")
+            and self.pages.get("main") is not None
+            and self.stack.currentWidget() == self.pages.get("main")
+        )
+
+    def _queue_realtime_frame(self, frame):
+        if self.realtime_closing or frame is None or not self._realtime_page_active():
+            return
+        if np is None:
+            if hasattr(self, "processing_hint"):
+                self.processing_hint.setText("处理: NumPy 不可用")
+            return
+
+        self.realtime_pending_frame = frame.copy()
+        self.realtime_pending_device_info = self.camera_panel.selected_device_info()
+        if self.realtime_worker is None or not self.realtime_worker.isRunning():
+            self._start_realtime_worker()
+
+    def _start_realtime_worker(self):
+        if self.realtime_closing or self.realtime_pending_frame is None:
+            return
+        if self.realtime_worker is not None and self.realtime_worker.isRunning():
+            return
+
+        frame = self.realtime_pending_frame
+        device_info = self.realtime_pending_device_info or self.camera_panel.selected_device_info()
+        self.realtime_pending_frame = None
+        self.realtime_pending_device_info = ""
+
+        try:
+            context = self.service.getRealtimeRecognitionContext()
+        except Exception as e:
+            if hasattr(self, "processing_hint"):
+                self.processing_hint.setText(f"处理: 准备失败 {e}")
+            return
+
+        worker = RealtimeRecognitionWorker(
+            self.service.algorithm,
+            frame,
+            context,
+            device_info,
+            self.realtime_generation,
+            self,
+        )
+        self.realtime_worker = worker
+        worker.result_ready.connect(self.on_realtime_result)
+        worker.finished.connect(self.on_realtime_worker_finished)
+        worker.start()
+
+    def on_realtime_result(self, result):
+        if self.realtime_closing or result.get("generation") != self.realtime_generation:
+            return
+
+        faces = result.get("faces") or []
+        if result.get("success"):
+            self.camera_panel.set_face_annotations(faces)
+            self._update_realtime_result_labels(faces)
+            self.service.recordRealtimeMatches(faces, result.get("device_info"))
+            fps = float(result.get("processing_fps") or 0.0)
+            if hasattr(self, "processing_hint"):
+                self.processing_hint.setText(f"处理: {fps:.1f} FPS  人脸: {len(faces)}")
+            return
+
+        self.camera_panel.set_face_annotations([])
+        self._update_realtime_result_labels([], error=result.get("message", "实时识别失败"))
+        if hasattr(self, "processing_hint"):
+            self.processing_hint.setText(f"处理: 失败 {result.get('message', '')}")
+
+    def on_realtime_worker_finished(self):
+        sender = self.sender()
+        if sender is self.realtime_worker:
+            self.realtime_worker = None
+        if not self.realtime_closing and self.realtime_pending_frame is not None:
+            self._start_realtime_worker()
+
+    def _clear_realtime_view(self):
+        self.realtime_generation += 1
+        self.realtime_pending_frame = None
+        self.realtime_pending_device_info = ""
+        if hasattr(self, "camera_panel"):
+            self.camera_panel.set_face_annotations([])
+        if hasattr(self, "processing_hint"):
+            self.processing_hint.setText("处理: -")
+        self._reset_result_labels()
+
+    def stop_realtime_recognition(self, wait_ms=1500):
+        self._clear_realtime_view()
+        worker = self.realtime_worker
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+            worker.wait(wait_ms)
+
+    def _reset_result_labels(self):
+        if not hasattr(self, "result_user"):
+            return
+        self.result_user.setText("用户: -")
+        self.result_id.setText("用户ID: -")
+        self.result_similarity.setText("相似度: -")
+        self.result_status.setText("结果: -")
+
+    def _update_realtime_result_labels(self, faces, error=None):
+        if not hasattr(self, "result_user"):
+            return
+        if error:
+            self.result_user.setText("用户: -")
+            self.result_id.setText("用户ID: -")
+            self.result_similarity.setText("相似度: -")
+            self.result_status.setText(f"结果: {error}")
+            return
+
+        if not faces:
+            self.result_user.setText("用户: 未检测到人脸")
+            self.result_id.setText("用户ID: -")
+            self.result_similarity.setText("相似度: -")
+            self.result_status.setText("结果: -")
+            return
+
+        users = []
+        ids = []
+        similarities = []
+        statuses = []
+        for index, face in enumerate(faces, start=1):
+            matched = bool(face.get("matched"))
+            username = face.get("username") or "陌生人"
+            user_id = face.get("user_id") if matched else None
+            similarity = float(face.get("similarity") or 0.0)
+            users.append(f"{index}. {username}")
+            ids.append(f"{index}. {user_id if user_id is not None else '-'}")
+            similarities.append(f"{index}. {similarity:.4f}")
+            statuses.append(f"{index}. {'已识别' if matched else '陌生人'}")
+
+        self.result_user.setText("用户:\n" + "\n".join(users))
+        self.result_id.setText("用户ID:\n" + "\n".join(ids))
+        self.result_similarity.setText("相似度:\n" + "\n".join(similarities))
+        self.result_status.setText("结果:\n" + "\n".join(statuses))
 
     @staticmethod
     def _camera_label(camera_id):
@@ -1225,6 +1664,7 @@ class FaceSystemUI(QMainWindow):
             return
 
         camera_id = int(camera_id)
+        self._clear_realtime_view()
         self.stop_mobile_camera(silent=True)
         self.cam_status.setText("状态: 正在连接")
         self.cam_info.setText(f"设备: camera:{camera_id}")
@@ -1281,6 +1721,7 @@ class FaceSystemUI(QMainWindow):
             self.err(f"启动手机摄像头服务失败: {e}")
             return
 
+        self._clear_realtime_view()
         self.camera_panel.use_mobile_source()
         self.cam_status.setText("状态: 等待手机扫码")
         self.cam_info.setText("设备: mobile-browser")
@@ -1301,6 +1742,7 @@ class FaceSystemUI(QMainWindow):
                 self.mobile_camera_server = None
                 self.mobile_camera_url = ""
 
+        self._clear_realtime_view()
         self._close_mobile_scan_dialog()
         self._set_mobile_button_running(False)
 
@@ -1412,8 +1854,7 @@ class FaceSystemUI(QMainWindow):
         self.current_user = resp["data"]["username"]
         self.current_user_id = resp["data"]["user_id"]
         self.current_role = resp["data"]["role"]
-        self.info(resp["message"])
-        self.go("admin_main" if self.current_role == "admin" else "main")
+        self.start_model_initialization("admin_main" if self.current_role == "admin" else "main")
 
     def do_register(self):
         username = self.reg_user.text().strip()
@@ -1505,6 +1946,11 @@ class FaceSystemUI(QMainWindow):
             self.err(recog_resp["message"])
 
     def closeEvent(self, event):
+        self.realtime_closing = True
+        try:
+            self.stop_realtime_recognition(wait_ms=1500)
+        except Exception:
+            pass
         try:
             self.stop_mobile_camera(silent=True)
         except Exception:
@@ -1512,6 +1958,11 @@ class FaceSystemUI(QMainWindow):
         try:
             if self.camera_scan_thread and self.camera_scan_thread.isRunning():
                 self.camera_scan_thread.wait(1500)
+        except Exception:
+            pass
+        try:
+            if self.initialization_thread and self.initialization_thread.isRunning():
+                self.initialization_thread.wait(1500)
         except Exception:
             pass
         try:

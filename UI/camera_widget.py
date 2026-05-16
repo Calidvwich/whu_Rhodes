@@ -1,7 +1,7 @@
 import importlib
 from datetime import datetime
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QRect, QThread, pyqtSignal, QTimer, Qt
+from PyQt5.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout
 
 
@@ -115,6 +115,7 @@ class CameraPanel(QWidget):
         self.last_frame = None
         self.current_camera_index = int(camera_index)
         self.source_kind = "local"
+        self.face_annotations = []
 
         self.start_camera()
 
@@ -146,6 +147,7 @@ class CameraPanel(QWidget):
         self.current_camera_index = camera_index
         self.source_kind = "local"
         self.last_frame = None
+        self.set_face_annotations([])
         self.label.clear()
         self.start_camera(camera_index)
         return True
@@ -175,6 +177,7 @@ class CameraPanel(QWidget):
         self.stop_camera()
         self.source_kind = "mobile"
         self.last_frame = None
+        self.set_face_annotations([])
         self.label.setText("等待手机浏览器画面...")
 
     def update_mobile_frame(self, frame_bgr):
@@ -183,6 +186,7 @@ class CameraPanel(QWidget):
         self.update_frame(frame_bgr)
 
     def on_camera_lost(self, msg):
+        self.set_face_annotations([])
         self.camera_error.emit(msg, self.current_camera_index)
         self.label.setText("未检测到摄像头，点击刷新或等待周期性重试...")
         if not self.no_camera_timer.isActive():
@@ -208,10 +212,72 @@ class CameraPanel(QWidget):
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        self._draw_annotations(qimg)
         pix = QPixmap.fromImage(qimg).scaled(
             self.label.width(), self.label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.label.setPixmap(pix)
+
+    def set_face_annotations(self, annotations):
+        self.face_annotations = list(annotations or [])
+
+    def _draw_annotations(self, qimg):
+        if not self.face_annotations:
+            return
+
+        painter = QPainter(qimg)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = QFont("Microsoft YaHei", 14)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+
+        for item in self.face_annotations:
+            box = item.get("box") or []
+            if len(box) < 4:
+                continue
+
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box[:4]]
+            x1 = max(0, min(x1, qimg.width() - 1))
+            y1 = max(0, min(y1, qimg.height() - 1))
+            x2 = max(0, min(x2, qimg.width() - 1))
+            y2 = max(0, min(y2, qimg.height() - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            matched = bool(item.get("matched"))
+            stroke = QColor(34, 197, 94) if matched else QColor(245, 158, 11)
+            painter.setPen(QPen(stroke, 3))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRect(x1, y1, x2 - x1, y2 - y1))
+
+            username = item.get("username") or "陌生人"
+            similarity = float(item.get("similarity") or 0.0)
+            text = f"{username} {similarity:.3f}"
+            padding_x = 8
+            padding_y = 5
+            text_w = metrics.horizontalAdvance(text)
+            text_h = metrics.height()
+            label_w = min(qimg.width(), text_w + padding_x * 2)
+            label_h = text_h + padding_y * 2
+            label_x = min(max(0, x1), max(0, qimg.width() - label_w))
+            label_y = max(0, y1 - label_h)
+            if label_y == 0:
+                label_y = min(max(0, qimg.height() - label_h), y1)
+
+            bg = QColor(stroke)
+            bg.setAlpha(230)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(bg))
+            painter.drawRect(QRect(label_x, label_y, label_w, label_h))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(
+                QRect(label_x + padding_x, label_y + padding_y, max(1, label_w - padding_x * 2), text_h),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                text,
+            )
+
+        painter.end()
 
     def captureFrame(self, camera_id=None, resolution="640x480", frame_rate=30):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
