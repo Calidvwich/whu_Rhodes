@@ -8,10 +8,10 @@ import torch
 from PIL import Image
 
 from .facenet_extractor import ImageLike, _to_pil_rgb
-from .facenet_submodule import MTCNN
+from .retinaface_detector import DEFAULT_RETINAFACE_THRESHOLD, RetinaFaceDetector
 
 DEFAULT_OUTPUT_SIZE = 160
-DEFAULT_MTCNN_THRESHOLDS = (0.6, 0.7, 0.7)
+DEFAULT_DETECTOR_MAX_SIZE = 640
 
 # Standard 5-point facial landmark template in 160x160 space.
 REFERENCE_FACIAL_POINTS_160 = np.array(
@@ -25,7 +25,7 @@ REFERENCE_FACIAL_POINTS_160 = np.array(
     dtype=np.float32,
 )
 
-_PREPROCESSOR_CACHE: dict[tuple[str, int, float], "FacePreprocessor"] = {}
+_PREPROCESSOR_CACHE: dict[tuple[str, int, float, int], "FacePreprocessor"] = {}
 
 
 def _resolve_device(device: str | None) -> str:
@@ -113,23 +113,16 @@ class FacePreprocessor:
         device: str | None = None,
         output_size: int = DEFAULT_OUTPUT_SIZE,
         min_confidence: float = 0.0,
-        min_face_size: int = 20,
-        thresholds: tuple[float, float, float] = DEFAULT_MTCNN_THRESHOLDS,
-        factor: float = 0.709,
+        detection_threshold: float = DEFAULT_RETINAFACE_THRESHOLD,
+        detector_max_size: int = DEFAULT_DETECTOR_MAX_SIZE,
     ) -> None:
         self.device = _resolve_device(device)
         self.output_size = int(output_size)
         self.min_confidence = float(min_confidence)
-        self.mtcnn = MTCNN(
-            image_size=self.output_size,
-            margin=0,
-            min_face_size=min_face_size,
-            thresholds=list(thresholds),
-            factor=factor,
-            post_process=False,
-            select_largest=True,
-            keep_all=True,
+        self.detector = RetinaFaceDetector(
             device=self.device,
+            detection_threshold=detection_threshold,
+            max_size=detector_max_size,
         )
 
     def detect_largest_face(self, image: ImageLike) -> tuple[Image.Image, FaceDetection]:
@@ -139,29 +132,27 @@ class FacePreprocessor:
 
     def detect_faces(self, image: ImageLike) -> tuple[Image.Image, list[FaceDetection]]:
         pil_image = _to_pil_rgb(image)
-        boxes, probs, points = self.mtcnn.detect(pil_image, landmarks=True)
-        if boxes is None or probs is None or points is None or len(boxes) == 0:
+        raw_detections = self.detector.detect(pil_image, min_confidence=self.min_confidence)
+        if not raw_detections:
             raise RuntimeError("no face detected in image")
 
         detections: list[FaceDetection] = []
-        for box, prob, landmark in zip(boxes, probs, points):
-            if box is None or prob is None or landmark is None:
-                continue
-            box_arr = np.asarray(box, dtype=np.float32).reshape(-1)
-            landmark_arr = np.asarray(landmark, dtype=np.float32).reshape(5, 2)
+        for detection in raw_detections:
+            box_arr = np.asarray(detection.box, dtype=np.float32).reshape(-1)
+            landmark_arr = np.asarray(detection.landmarks, dtype=np.float32).reshape(5, 2)
             width = max(0.0, float(box_arr[2] - box_arr[0]))
             height = max(0.0, float(box_arr[3] - box_arr[1]))
             detections.append(
                 FaceDetection(
                     box=box_arr,
                     landmarks=landmark_arr,
-                    probability=float(prob),
+                    probability=float(detection.probability),
                     area=width * height,
                 )
             )
 
         if not detections:
-            raise RuntimeError("MTCNN returned no valid face candidates")
+            raise RuntimeError("RetinaFace returned no valid face candidates")
 
         candidates = [d for d in detections if d.probability >= self.min_confidence]
         if not candidates:
@@ -205,15 +196,17 @@ def get_preprocessor(
     device: str | None = None,
     output_size: int = DEFAULT_OUTPUT_SIZE,
     min_confidence: float = 0.0,
+    detector_max_size: int = DEFAULT_DETECTOR_MAX_SIZE,
 ) -> FacePreprocessor:
     resolved_device = _resolve_device(device)
-    cache_key = (resolved_device, int(output_size), float(min_confidence))
+    cache_key = (resolved_device, int(output_size), float(min_confidence), int(detector_max_size))
     preprocessor = _PREPROCESSOR_CACHE.get(cache_key)
     if preprocessor is None:
         preprocessor = FacePreprocessor(
             device=resolved_device,
             output_size=output_size,
             min_confidence=min_confidence,
+            detector_max_size=detector_max_size,
         )
         _PREPROCESSOR_CACHE[cache_key] = preprocessor
     return preprocessor
@@ -225,11 +218,13 @@ def preprocess_face_image(
     device: str | None = None,
     output_size: int = DEFAULT_OUTPUT_SIZE,
     min_confidence: float = 0.0,
+    detector_max_size: int = DEFAULT_DETECTOR_MAX_SIZE,
 ) -> Image.Image:
     preprocessor = get_preprocessor(
         device=device,
         output_size=output_size,
         min_confidence=min_confidence,
+        detector_max_size=detector_max_size,
     )
     return preprocessor.preprocess(image).image
 
@@ -240,11 +235,13 @@ def preprocess_face(
     device: str | None = None,
     output_size: int = DEFAULT_OUTPUT_SIZE,
     min_confidence: float = 0.0,
+    detector_max_size: int = DEFAULT_DETECTOR_MAX_SIZE,
 ) -> PreprocessResult:
     preprocessor = get_preprocessor(
         device=device,
         output_size=output_size,
         min_confidence=min_confidence,
+        detector_max_size=detector_max_size,
     )
     return preprocessor.preprocess(image)
 
@@ -255,11 +252,13 @@ def preprocess_faces(
     device: str | None = None,
     output_size: int = DEFAULT_OUTPUT_SIZE,
     min_confidence: float = 0.0,
+    detector_max_size: int = DEFAULT_DETECTOR_MAX_SIZE,
 ) -> list[PreprocessResult]:
     preprocessor = get_preprocessor(
         device=device,
         output_size=output_size,
         min_confidence=min_confidence,
+        detector_max_size=detector_max_size,
     )
     return preprocessor.preprocess_all(image)
 
