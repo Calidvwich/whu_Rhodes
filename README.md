@@ -67,20 +67,20 @@ git submodule update --remote
 cd <你的 whu_Rhodes 仓库目录>
 
 conda create -n whu_rhodes_ui python=3.12 -y
-conda run -n whu_rhodes_ui python -m pip install -r UI\requirements.txt
-conda run -n whu_rhodes_ui python -m pip install -r face_engine\requirements.txt
+conda run -n whu_rhodes_ui python -m pip install -r UI/requirements.txt
+conda run -n whu_rhodes_ui python -m pip install -r face_engine/requirements.txt
 ```
 
 初始化本地数据库：
 
 ```powershell
-conda run -n whu_rhodes_ui python database\scripts\init_db.py
+conda run -n whu_rhodes_ui python database/scripts/init_db.py
 ```
 
 首次运行算法层时会自动下载 FaceNet 预训练权重。权重缓存目录固定为 `face_engine/.model_cache/`，该目录已被 `.gitignore` 忽略，不要提交到仓库。可先用示例图验证特征提取：
 
 ```powershell
-conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str(Path('face_engine/src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(r'face_engine\examples\aligned_face.png', model_cache=r'face_engine\.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
+conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str((Path('face_engine') / 'src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(Path('face_engine') / 'examples' / 'aligned_face.png', model_cache=Path('face_engine') / '.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
 ```
 
 成功时应输出类似：
@@ -92,8 +92,32 @@ conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib i
 启动 PyQt5 UI：
 
 ```powershell
-conda run -n whu_rhodes_ui python UI\face_ui_pyqt5.py
+conda run -n whu_rhodes_ui python UI/face_ui_pyqt5.py
 ```
+
+关于摄像头：
+
+- 若需要稳定使用本机 Windows 摄像头，优先在 Windows 原生终端中运行上面的命令。
+- 当前 UI 在 Windows 下会依次尝试 `DirectShow`、`Media Foundation` 和 OpenCV 自动后端。
+- 若你是在 WSL 中运行，只有当 Linux 侧真的出现 `/dev/video*` 设备时，OpenCV 才能打开摄像头。
+
+如果你是在 Linux / WSL 下运行 PyQt5 UI，请额外注意：
+
+- WSLg 环境建议优先走 Wayland：
+
+```bash
+env QT_QPA_PLATFORM=wayland conda run -n whu_rhodes_ui python UI/face_ui_pyqt5.py
+```
+
+- 若仍报 `Could not load the Qt platform plugin "xcb"`，先补齐系统库：
+
+```bash
+sudo apt update
+sudo apt install -y libxcb-icccm4 libxcb-keysyms1
+```
+
+- 若 UI 明确提示 “WSL2 中没有任何 `/dev/video*` 设备”，说明当前不是代码问题，而是 WSL 环境还没有拿到摄像头设备。此时请优先改为 Windows 原生运行；若必须在 WSL 中使用，请先用 `usbipd-win` 将 USB 摄像头附加到 WSL。
+- 当前 UI 已在代码里优先使用 `PyQt5` 自身的 Qt 插件目录，避免 `opencv-python` 自带的 `cv2/qt/plugins` 干扰 PyQt5 启动。
 
 本地演示账号由 UI 业务层自动初始化：
 
@@ -103,7 +127,7 @@ conda run -n whu_rhodes_ui python UI\face_ui_pyqt5.py
 注意事项：
 
 - `UI/.venv/`、`database/.venv/`、`__pycache__/`、`*.pyc`、`face_engine/.model_cache/` 都不要提交。
-- `database/data/app.sqlite3` 是本地开发数据库。换电脑后如果没有数据库文件，先运行 `database\scripts\init_db.py`，再重新录入人脸特征。
+- `database/data/app.sqlite3` 是本地开发数据库。换电脑后如果没有数据库文件，先运行 `database/scripts/init_db.py`，再重新录入人脸特征。
 - 第一次提取特征需要联网下载模型权重；下载完成后会走本地缓存。
 - 当前开发期数据库使用 SQLite，后续如迁移 MySQL，优先改 `database/src/db/connection.py` 与建表 SQL，算法向量接口尽量保持不变。
 

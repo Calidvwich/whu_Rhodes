@@ -2,5 +2,15 @@
 ./UI/.venv/
 venv/
 .venv/
+database/.venv/
+database/data/
+database/**/*.sqlite3
 UI/__pycache__/
+database/**/__pycache__/
+__pycache__/
+*.pyc
+.pytest_cache/
 AGENTS.md
+/face_engine/.model_cache/
+/face_engine\\.model_cache/
+/__pycache__/

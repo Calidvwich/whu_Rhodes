@@ -37,6 +37,26 @@ pip install -r ../face_engine/requirements.txt
 python face_ui_pyqt5.py
 ```
 
+摄像头说明：
+
+- 在 Windows 原生环境运行时，程序会依次尝试 `DirectShow`、`Media Foundation` 和 OpenCV 自动后端。
+- 如果你通过 VS Code Remote WSL 在 Linux 环境里运行，只有当 WSL 内能看到 `/dev/video*` 时摄像头才可用。
+
+Linux / WSL 补充说明：
+
+```bash
+env QT_QPA_PLATFORM=wayland python face_ui_pyqt5.py
+```
+
+若仍出现 `Could not load the Qt platform plugin "xcb"`，请安装缺失系统库：
+
+```bash
+sudo apt update
+sudo apt install -y libxcb-icccm4 libxcb-keysyms1
+```
+
+如果程序提示 WSL2 中没有任何 `/dev/video*` 设备，请直接切换到 Windows 原生 Python/Conda 环境运行；这类情况不是 UI 代码本身能修复的。
+
 若执行策略禁止 `Activate.ps1`，可不用激活，直接用完整路径：
 
 ```powershell

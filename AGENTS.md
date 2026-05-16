@@ -25,8 +25,8 @@
 
 ```powershell
 conda create -n whu_rhodes_ui python=3.12 -y
-conda run -n whu_rhodes_ui python -m pip install -r UI\requirements.txt
-conda run -n whu_rhodes_ui python -m pip install -r face_engine\requirements.txt
+conda run -n whu_rhodes_ui python -m pip install -r UI/requirements.txt
+conda run -n whu_rhodes_ui python -m pip install -r face_engine/requirements.txt
 ```
 
 也可以使用本地 venv，但不要提交虚拟环境目录。首次调用 FaceNet 可能联网下载预训练权重，缓存目录为 `face_engine/.model_cache/`。
@@ -43,29 +43,29 @@ conda run -n whu_rhodes_ui python -m pip install -r face_engine\requirements.txt
 
 ```powershell
 # 初始化 SQLite 数据库
-conda run -n whu_rhodes_ui python database\scripts\init_db.py
+conda run -n whu_rhodes_ui python database/scripts/init_db.py
 
 # 验证算法层能输出 512 维、L2 归一化向量
-conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str(Path('face_engine/src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(r'face_engine\examples\aligned_face.png', model_cache=r'face_engine\.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
+conda run -n whu_rhodes_ui python -B -c "import sys, numpy as np; from pathlib import Path; sys.path.insert(0, str((Path('face_engine') / 'src').resolve())); from face_engine import extract_from_aligned_face; vec = extract_from_aligned_face(Path('face_engine') / 'examples' / 'aligned_face.png', model_cache=Path('face_engine') / '.model_cache'); print(vec.shape, float(np.linalg.norm(vec)))"
 
 # 启动 PyQt5 UI
-conda run -n whu_rhodes_ui python UI\face_ui_pyqt5.py
+conda run -n whu_rhodes_ui python UI/face_ui_pyqt5.py
 ```
 
 算法层 CLI：
 
 ```powershell
-python face_engine\scripts\preprocess_face.py single --image path\to\raw_face.jpg --out-image face_engine\examples\aligned_face.png
-python face_engine\scripts\extract_feature.py single --image face_engine\examples\aligned_face.png --out-json database\examples\face_a.json
-python face_engine\scripts\verify_extractor.py --download-samples
+python face_engine/scripts/preprocess_face.py single --image path/to/raw_face.jpg --out-image face_engine/examples/aligned_face.png
+python face_engine/scripts/extract_feature.py single --image face_engine/examples/aligned_face.png --out-json database/examples/face_a.json
+python face_engine/scripts/verify_extractor.py --download-samples
 ```
 
 数据库联调 CLI：
 
 ```powershell
-python database\scripts\feature_from_json.py enroll --username alice --vector-json database\examples\vector_512.json
-python database\scripts\feature_from_json.py recognize --vector-json database\examples\vector_512.json --device-info demo_camera
-python database\scripts\inspect_db.py
+python database/scripts/feature_from_json.py enroll --username alice --vector-json database/examples/vector_512.json
+python database/scripts/feature_from_json.py recognize --vector-json database/examples/vector_512.json --device-info demo_camera
+python database/scripts/inspect_db.py
 ```
 
 ## 核心契约
@@ -118,8 +118,7 @@ python database\scripts\inspect_db.py
 
 按改动范围选择验证：
 
-- 只改数据库层：运行 `python database\scripts\init_db.py`，再运行相关 `feature_from_json.py` 或 `demo_compare.py`。
-- 只改算法层：用 `face_engine\examples\aligned_face.png` 验证输出形状和范数，必要时运行 `verify_extractor.py`。
-- 改 UI 业务层：至少启动 `python UI\face_ui_pyqt5.py`，验证登录、注册、管理员用户管理入口；涉及识别时再验证图片/摄像头流程。
+- 只改数据库层：运行 `python database/scripts/init_db.py`，再运行相关 `feature_from_json.py` 或 `demo_compare.py`。
+- 只改算法层：用 `face_engine/examples/aligned_face.png` 验证输出形状和范数，必要时运行 `verify_extractor.py`。
+- 改 UI 业务层：至少启动 `python UI/face_ui_pyqt5.py`，验证登录、注册、管理员用户管理入口；涉及识别时再验证图片/摄像头流程。
 - 改 schema 或响应结构：同时做一次 `UI -> face_engine -> database -> UI` 的最小链路验证。
-

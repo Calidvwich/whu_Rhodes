@@ -1,8 +1,17 @@
 import importlib
+import os
+import sys
+import time
 from datetime import datetime
+from pathlib import Path
+
+from qt_bootstrap import prepare_qt_runtime
+
+prepare_qt_runtime()
+
 from PyQt5.QtCore import QRect, QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout
+from PyQt5.QtWidgets import QLabel, QMessageBox, QVBoxLayout, QWidget
 
 
 def _optional_import(module_name):
@@ -15,59 +24,166 @@ def _optional_import(module_name):
 cv2 = _optional_import("cv2")
 
 
-def camera_display_name(camera_index):
-    if int(camera_index) == 0:
-        return "电脑摄像头 camera:0"
-    return f"可用摄像头 camera:{int(camera_index)}"
+class _ClosedCapture:
+    def isOpened(self):
+        return False
+
+    def release(self):
+        return None
+
+
+def _is_wsl() -> bool:
+    return sys.platform.startswith("linux") and (
+        "microsoft" in os.uname().release.lower() or bool(os.environ.get("WSL_DISTRO_NAME"))
+    )
+
+
+def _list_linux_video_devices():
+    return sorted(str(path) for path in Path("/dev").glob("video*"))
+
+
+def _candidate_backends():
+    if cv2 is None:
+        return [("unavailable", None)]
+
+    candidates = []
+    if sys.platform.startswith("win"):
+        if hasattr(cv2, "CAP_DSHOW"):
+            candidates.append(("DirectShow", cv2.CAP_DSHOW))
+        if hasattr(cv2, "CAP_MSMF"):
+            candidates.append(("Media Foundation", cv2.CAP_MSMF))
+    elif sys.platform.startswith("linux"):
+        if hasattr(cv2, "CAP_V4L2"):
+            candidates.append(("V4L2", cv2.CAP_V4L2))
+
+    candidates.append(("Auto", None))
+    return candidates
+
+
+def _open_video_capture(camera_index):
+    if cv2 is None:
+        return None, None, ["OpenCV 未安装"]
+
+    if sys.platform.startswith("linux") and not _list_linux_video_devices():
+        return _ClosedCapture(), None, ["Linux 未发现 /dev/video* 设备"]
+
+    errors = []
+    for backend_name, backend in _candidate_backends():
+        if backend is None:
+            cap = cv2.VideoCapture(camera_index)
+        else:
+            cap = cv2.VideoCapture(camera_index, backend)
+        if cap.isOpened():
+            return cap, backend_name, errors
+        errors.append(f"{backend_name} 打开失败")
+        cap.release()
+
+    return cap, None, errors
 
 
 def scan_available_cameras(max_index=8, skip_indices=None):
-    devices = []
     if cv2 is None:
-        return devices
+        return []
 
     skip = {int(i) for i in (skip_indices or [])}
-    for index in range(int(max_index) + 1):
-        if index in skip:
+    if sys.platform.startswith("linux") and not _list_linux_video_devices():
+        return []
+
+    devices = []
+    for camera_index in range(int(max_index)):
+        if camera_index in skip:
             continue
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+
+        cap, backend_name, _errors = _open_video_capture(camera_index)
         try:
-            if cap.isOpened():
+            if cap is not None and cap.isOpened():
+                backend = f" ({backend_name})" if backend_name else ""
                 devices.append({
-                    "index": index,
-                    "name": camera_display_name(index),
+                    "index": camera_index,
+                    "name": f"camera:{camera_index}{backend}",
                 })
         finally:
-            cap.release()
+            if cap is not None:
+                cap.release()
+
     return devices
+
+
+def _build_camera_unavailable_message(camera_index, errors):
+    prefix = f"camera:{camera_index} 不可用。"
+    if _is_wsl():
+        devices = _list_linux_video_devices()
+        if not devices:
+            return (
+                f"{prefix} 当前运行在 WSL2，但 Linux 侧没有任何 /dev/video* 设备。"
+                "Windows 主机摄像头不会自动暴露给 WSL。"
+                "如需直接使用摄像头，请优先在 Windows 原生 Python/Conda 环境运行该 UI；"
+                "若必须在 WSL 中使用，请先用 usbipd-win 将 USB 摄像头附加到 WSL。"
+            )
+        return (
+            f"{prefix} WSL 中已看到设备 {', '.join(devices)}，但 OpenCV 打开失败。"
+            f"已尝试后端: {', '.join(errors) or '无'}。"
+        )
+
+    if sys.platform.startswith("linux"):
+        devices = _list_linux_video_devices()
+        if not devices:
+            return f"{prefix} Linux 下未发现 /dev/video* 设备。"
+        return f"{prefix} 已发现设备 {', '.join(devices)}，但 OpenCV 打开失败。已尝试后端: {', '.join(errors) or '无'}。"
+
+    if sys.platform.startswith("win"):
+        return (
+            f"{prefix} 已尝试后端: {', '.join(errors) or '无'}。"
+            "请检查 Windows 相机权限、设备是否被其他应用占用，或切换到原生 Windows 终端运行。"
+        )
+
+    return f"{prefix} 已尝试后端: {', '.join(errors) or '无'}。"
+
+
+def _build_camera_unavailable_detail(camera_index, errors):
+    if _is_wsl():
+        devices = _list_linux_video_devices()
+        if not devices:
+            return f"设备: camera:{camera_index}  WSL /dev/video*: 无"
+        return f"设备: {', '.join(devices)}  后端: {', '.join(errors) or '-'}"
+
+    if sys.platform.startswith("linux"):
+        devices = _list_linux_video_devices()
+        if not devices:
+            return f"设备: camera:{camera_index}  /dev/video*: 无"
+        return f"设备: {', '.join(devices)}  后端: {', '.join(errors) or '-'}"
+
+    return f"设备: camera:{camera_index}  后端: {', '.join(errors) or '-'}"
 
 
 class CameraThread(QThread):
     frame_ready = pyqtSignal(object)   # numpy frame (BGR)
-    camera_lost = pyqtSignal(str)
+    camera_lost = pyqtSignal(str, str)
 
     def __init__(self, camera_index=0):
         super().__init__()
         self.camera_index = camera_index
         self.running = False
         self.cap = None
+        self.backend_name = None
 
     def run(self):
         self.running = True
         if cv2 is None:
-            self.camera_lost.emit(f"camera:{self.camera_index} 未安装 OpenCV，摄像头功能不可用")
+            self.camera_lost.emit("未安装 OpenCV，摄像头功能不可用", "设备: -")
             return
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        self.cap, self.backend_name, errors = _open_video_capture(self.camera_index)
         if not self.cap.isOpened():
-            self.camera_lost.emit(f"camera:{self.camera_index} 未检测到摄像头")
-            self.cap.release()
-            self.cap = None
+            msg = _build_camera_unavailable_message(self.camera_index, errors)
+            detail = _build_camera_unavailable_detail(self.camera_index, errors)
+            self.camera_lost.emit(msg, detail)
             return
 
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
-                self.camera_lost.emit(f"camera:{self.camera_index} 摄像头读取失败")
+                detail = f"设备: camera:{self.camera_index}  后端: {self.backend_name or '-'}"
+                self.camera_lost.emit("摄像头读取失败", detail)
                 break
             self.frame_ready.emit(frame)
             self.msleep(30)
@@ -108,60 +224,25 @@ class CameraPanel(QWidget):
         lay.addWidget(self.label)
 
         self.thread = None
+        self.current_camera_index = int(camera_index)
+        self.source_kind = "local"
         self.no_camera_timer = QTimer(self)
         self.no_camera_timer.setInterval(8000)  # 每8秒重试并提示一次
         self.no_camera_timer.timeout.connect(self.try_reconnect)
 
+        self.last_warn_time = 0
+        self.last_warn_msg = None
+        self.warn_interval_sec = 8
         self.last_frame = None
-        self.current_camera_index = int(camera_index)
-        self.source_kind = "local"
         self.face_annotations = []
+        self.status_label = None
+        self.info_label = None
 
         self.start_camera()
 
-    def start_camera(self, camera_index=None):
-        if camera_index is not None:
-            self.current_camera_index = int(camera_index)
-        if self.thread and self.thread.isRunning():
-            return
-        self.source_kind = "local"
-        self.label.setText(f"正在连接 camera:{self.current_camera_index} ...")
-        self.thread = CameraThread(camera_index=self.current_camera_index)
-        self.thread.frame_ready.connect(self.update_frame)
-        self.thread.camera_lost.connect(self.on_camera_lost)
-        self.thread.start()
-
-    def stop_camera(self):
-        if self.thread:
-            self.thread.stop()
-            self.thread = None
-
-    def switch_camera(self, camera_index):
-        camera_index = int(camera_index)
-        if camera_index == self.current_camera_index and self.thread and self.thread.isRunning():
-            return True
-
-        if self.no_camera_timer.isActive():
-            self.no_camera_timer.stop()
-        self.stop_camera()
-        self.current_camera_index = camera_index
-        self.source_kind = "local"
-        self.last_frame = None
-        self.set_face_annotations([])
-        self.label.clear()
-        self.start_camera(camera_index)
-        return True
-
-    def scan_devices(self, max_index=8):
-        skip = [self.current_camera_index] if self.source_kind == "local" and self.last_frame is not None else []
-        devices = scan_available_cameras(max_index=max_index, skip_indices=skip)
-        current_seen = any(d["index"] == self.current_camera_index for d in devices)
-        if self.source_kind == "local" and not current_seen and self.last_frame is not None:
-            devices.insert(0, {
-                "index": self.current_camera_index,
-                "name": camera_display_name(self.current_camera_index),
-            })
-        return devices
+    def bind_status_labels(self, status_label, info_label):
+        self.status_label = status_label
+        self.info_label = info_label
 
     def selected_camera_id(self):
         return self.current_camera_index
@@ -171,24 +252,73 @@ class CameraPanel(QWidget):
             return "mobile-browser"
         return f"camera:{self.current_camera_index}"
 
-    def use_mobile_source(self):
+    def start_camera(self, camera_index=None):
+        if self.thread and self.thread.isRunning():
+            return
+        if camera_index is not None:
+            self.current_camera_index = int(camera_index)
+        self.source_kind = "local"
+        self.last_frame = None
+        self.label.setText(f"正在连接 camera:{self.current_camera_index} ...")
+        self.thread = CameraThread(camera_index=self.current_camera_index)
+        self.thread.frame_ready.connect(self.update_frame)
+        self.thread.camera_lost.connect(self.on_camera_lost)
+        self.thread.start()
+
+    def stop_camera(self):
         if self.no_camera_timer.isActive():
             self.no_camera_timer.stop()
+        if self.thread is not None:
+            try:
+                self.thread.stop()
+            finally:
+                self.thread = None
+
+    def switch_camera(self, camera_index):
+        self.stop_camera()
+        self.current_camera_index = int(camera_index)
+        self.source_kind = "local"
+        self.last_frame = None
+        self.set_face_annotations([])
+        self.label.clear()
+        self.start_camera(self.current_camera_index)
+
+    def use_mobile_source(self):
         self.stop_camera()
         self.source_kind = "mobile"
         self.last_frame = None
         self.set_face_annotations([])
         self.label.setText("等待手机浏览器画面...")
+        if self.status_label is not None:
+            self.status_label.setText("状态: 等待手机扫码")
+        if self.info_label is not None:
+            self.info_label.setText("设备: mobile-browser")
 
     def update_mobile_frame(self, frame_bgr):
-        if self.source_kind != "mobile":
-            self.use_mobile_source()
-        self.update_frame(frame_bgr)
+        self.source_kind = "mobile"
+        self.last_frame = frame_bgr
+        self.frame_captured.emit(frame_bgr)
+        if self.status_label is not None:
+            self.status_label.setText("状态: 手机已连接")
+        if self.info_label is not None:
+            self.info_label.setText("设备: mobile-browser")
+        self._render_frame(frame_bgr)
 
-    def on_camera_lost(self, msg):
+    def on_camera_lost(self, msg, detail):
         self.set_face_annotations([])
         self.camera_error.emit(msg, self.current_camera_index)
-        self.label.setText("未检测到摄像头，点击刷新或等待周期性重试...")
+        now = time.time()
+        should_warn = msg != self.last_warn_msg or now - self.last_warn_time >= self.warn_interval_sec
+        if should_warn:
+            QMessageBox.warning(self, "摄像头状态", msg)
+            self.last_warn_time = now
+            self.last_warn_msg = msg
+
+        self.label.setText(msg)
+        if self.status_label is not None:
+            self.status_label.setText("状态: 不可用")
+        if self.info_label is not None:
+            self.info_label.setText(detail)
         if not self.no_camera_timer.isActive():
             self.no_camera_timer.start()
 
@@ -201,14 +331,27 @@ class CameraPanel(QWidget):
         if cv2 is None:
             self.label.setText("OpenCV 不可用，无法渲染视频")
             return
+        if self.source_kind != "local":
+            return
 
         if self.no_camera_timer.isActive():
             self.no_camera_timer.stop()
 
-        self.last_frame = frame_bgr.copy()
-        self.frame_captured.emit(self.last_frame)
+        self.last_frame = frame_bgr
+        self.frame_captured.emit(frame_bgr)
+        if self.status_label is not None:
+            self.status_label.setText("状态: 已连接")
+        if self.info_label is not None and self.thread is not None:
+            backend = self.thread.backend_name or "-"
+            self.info_label.setText(f"设备: camera:{self.current_camera_index}  后端: {backend}")
 
-        rgb = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2RGB)
+        self._render_frame(frame_bgr)
+
+    def _render_frame(self, frame_bgr):
+        if cv2 is None:
+            self.label.setText("OpenCV 不可用，无法渲染视频")
+            return
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
@@ -220,6 +363,17 @@ class CameraPanel(QWidget):
 
     def set_face_annotations(self, annotations):
         self.face_annotations = list(annotations or [])
+
+    def scan_devices(self, max_index=8):
+        skip = [self.current_camera_index] if self.source_kind == "local" and self.last_frame is not None else []
+        devices = scan_available_cameras(max_index=max_index, skip_indices=skip)
+        current_seen = any(int(d["index"]) == self.current_camera_index for d in devices)
+        if self.source_kind == "local" and not current_seen and self.last_frame is not None:
+            devices.insert(0, {
+                "index": self.current_camera_index,
+                "name": f"camera:{self.current_camera_index}",
+            })
+        return devices
 
     def _draw_annotations(self, qimg):
         if not self.face_annotations:
@@ -329,13 +483,17 @@ class CameraPanel(QWidget):
                 "timestamp": now_str,
             }
 
-        cap = cv2.VideoCapture(target_camera_id, cv2.CAP_DSHOW)
+        cap, backend_name, errors = _open_video_capture(target_camera_id)
         if not cap.isOpened():
             return {
                 "code": 5001,
                 "success": False,
-                "message": f"camera:{target_camera_id} 摄像头不可用",
-                "data": {"frame_data": None, "device_info": f"camera:{target_camera_id}"},
+                "message": _build_camera_unavailable_message(target_camera_id, errors),
+                "data": {
+                    "frame_data": None,
+                    "device_info": f"camera:{target_camera_id}",
+                    "backend": None,
+                },
                 "timestamp": now_str,
             }
 
@@ -373,6 +531,7 @@ class CameraPanel(QWidget):
                 "device_info": f"camera:{target_camera_id}",
                 "resolution": f"{width}x{height}",
                 "frame_rate": frame_rate,
+                "backend": backend_name,
             },
             "timestamp": now_str,
         }

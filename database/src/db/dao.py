@@ -21,6 +21,17 @@ class UserRow:
     role: str
 
 
+@dataclass(frozen=True)
+class RecognitionLogRow:
+    log_id: int
+    user_id: int | None
+    input_image_url: str | None
+    similarity: float | None
+    result: int
+    recognize_time: str
+    device_info: str | None
+
+
 def init_schema(conn: sqlite3.Connection, schema_sql: str) -> None:
     conn.executescript(schema_sql)
     conn.commit()
@@ -88,6 +99,7 @@ def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> UserRow | None:
         status=int(row["status"]),
         role=str(row["role"]),
     )
+
 
 def get_all_users(conn: sqlite3.Connection) -> list[UserRow]:
     rows = conn.execute(
@@ -187,6 +199,32 @@ def iter_all_active_features(conn: sqlite3.Connection) -> Iterable[tuple[int, np
         yield int(row["user_id"]), decode_feature_vector(row["feature_vector"])
 
 
+def deactivate_face_feature(conn: sqlite3.Connection, feature_id: int) -> int:
+    cur = conn.execute(
+        """
+        UPDATE face_feature
+        SET is_active = 0
+        WHERE feature_id = ?
+        """,
+        (int(feature_id),),
+    )
+    conn.commit()
+    return int(cur.rowcount)
+
+
+def deactivate_face_features_by_user_id(conn: sqlite3.Connection, user_id: int) -> int:
+    cur = conn.execute(
+        """
+        UPDATE face_feature
+        SET is_active = 0
+        WHERE user_id = ? AND is_active = 1
+        """,
+        (int(user_id),),
+    )
+    conn.commit()
+    return int(cur.rowcount)
+
+
 def insert_recognition_log(
     conn: sqlite3.Connection,
     *,
@@ -208,6 +246,77 @@ def insert_recognition_log(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def _recognition_log_from_row(row: sqlite3.Row) -> RecognitionLogRow:
+    similarity = row["similarity"]
+    return RecognitionLogRow(
+        log_id=int(row["log_id"]),
+        user_id=None if row["user_id"] is None else int(row["user_id"]),
+        input_image_url=row["input_image_url"],
+        similarity=None if similarity is None else float(similarity),
+        result=int(row["result"]),
+        recognize_time=str(row["recognize_time"]),
+        device_info=row["device_info"],
+    )
+
+
+def get_recognition_logs_by_user_id(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    limit: int = 100,
+) -> list[RecognitionLogRow]:
+    rows = conn.execute(
+        """
+        SELECT log_id, user_id, input_image_url, similarity, result, recognize_time, device_info
+        FROM recognition_log
+        WHERE user_id = ?
+        ORDER BY recognize_time DESC, log_id DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    ).fetchall()
+    return [_recognition_log_from_row(row) for row in rows]
+
+
+def get_recognition_logs_by_time_range(
+    conn: sqlite3.Connection,
+    start_time: str,
+    end_time: str,
+    *,
+    limit: int = 100,
+) -> list[RecognitionLogRow]:
+    rows = conn.execute(
+        """
+        SELECT log_id, user_id, input_image_url, similarity, result, recognize_time, device_info
+        FROM recognition_log
+        WHERE recognize_time >= ? AND recognize_time <= ?
+        ORDER BY recognize_time DESC, log_id DESC
+        LIMIT ?
+        """,
+        (start_time, end_time, int(limit)),
+    ).fetchall()
+    return [_recognition_log_from_row(row) for row in rows]
+
+
+def get_recognition_logs_by_device_info(
+    conn: sqlite3.Connection,
+    device_info: str,
+    *,
+    limit: int = 100,
+) -> list[RecognitionLogRow]:
+    rows = conn.execute(
+        """
+        SELECT log_id, user_id, input_image_url, similarity, result, recognize_time, device_info
+        FROM recognition_log
+        WHERE device_info = ?
+        ORDER BY recognize_time DESC, log_id DESC
+        LIMIT ?
+        """,
+        (device_info, int(limit)),
+    ).fetchall()
+    return [_recognition_log_from_row(row) for row in rows]
 
 
 def get_config_by_key(conn: sqlite3.Connection, key: str) -> str | None:
