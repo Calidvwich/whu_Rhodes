@@ -7,9 +7,9 @@
 建议直接复用项目联调用的 Conda 环境：
 
 ```powershell
-cd D:\mowang\2026_1\ZongHeXiangMu\whu_Rhodes
+cd <你的 whu_Rhodes 仓库目录>
 conda activate whu_rhodes_ui
-pip install -r database\requirements.txt
+pip install -r database/requirements.txt
 ```
 
 如果从零创建环境，Python 版本建议使用 3.10 或 3.11。
@@ -17,7 +17,7 @@ pip install -r database\requirements.txt
 ## 初始化数据库
 
 ```powershell
-python database\scripts\init_db.py
+python database/scripts/init_db.py
 ```
 
 初始化脚本会读取 `database/src/db/schema.sql`，创建 `user`、`face_feature`、`recognition_log`、`system_config` 四张表，并写入默认阈值：
@@ -62,7 +62,7 @@ result = service.recognize(feature_vector, device_info="desktop-camera")
 数据库烟测：
 
 ```powershell
-python database\scripts\smoke_test.py
+python database/scripts/smoke_test.py
 ```
 
 该脚本使用临时 SQLite 数据库，不会污染 `database/data/app.sqlite3`。它会覆盖初始化、注册、命中识别、陌生人拒绝、日志查询、特征停用几个关键路径。
@@ -70,7 +70,7 @@ python database\scripts\smoke_test.py
 阈值说明脚本：
 
 ```powershell
-python database\scripts\threshold_report.py --threshold 0.65
+python database/scripts/threshold_report.py --threshold 0.65
 ```
 
 该脚本输出一组固定随机种子的余弦相似度样例，用来解释阈值判断逻辑。注意它是合成向量 sanity check，最终报告里如果需要更强证据，应替换为真实人脸特征向量样本。
@@ -78,21 +78,21 @@ python database\scripts\threshold_report.py --threshold 0.65
 旧 demo 仍可运行：
 
 ```powershell
-python database\scripts\demo_compare.py
+python database/scripts/demo_compare.py
 ```
 
 如果算法模块已经导出了 `{"vector":[512 floats]}` 格式的 JSON，也可以继续使用旧的 JSON 联调脚本：
 
 ```powershell
-python database\scripts\feature_from_json.py enroll --username alice --vector-json database\examples\vector_512.json
-python database\scripts\feature_from_json.py recognize --vector-json database\examples\vector_512.json
+python database/scripts/feature_from_json.py enroll --username alice --vector-json database/examples/vector_512.json
+python database/scripts/feature_from_json.py recognize --vector-json database/examples/vector_512.json
 ```
 
 ## 数据提交策略
 
 - 代码、schema、脚本、README 可以提交。
 - `.venv/`、`__pycache__/`、`.pytest_cache/`、`database/data/`、`*.sqlite3` 不提交。
-- 如果本地数据库坏了，可以删除 `database/data/app.sqlite3` 后重新执行 `python database\scripts\init_db.py`。
+- 如果本地数据库坏了，可以删除 `database/data/app.sqlite3` 后重新执行 `python database/scripts/init_db.py`。
 
 ## 后续迁移 MySQL 的位置
 

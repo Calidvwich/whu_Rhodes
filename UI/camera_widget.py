@@ -81,6 +81,34 @@ def _open_video_capture(camera_index):
     return cap, None, errors
 
 
+def scan_available_cameras(max_index=8, skip_indices=None):
+    if cv2 is None:
+        return []
+
+    skip = {int(i) for i in (skip_indices or [])}
+    if sys.platform.startswith("linux") and not _list_linux_video_devices():
+        return []
+
+    devices = []
+    for camera_index in range(int(max_index)):
+        if camera_index in skip:
+            continue
+
+        cap, backend_name, _errors = _open_video_capture(camera_index)
+        try:
+            if cap is not None and cap.isOpened():
+                backend = f" ({backend_name})" if backend_name else ""
+                devices.append({
+                    "index": camera_index,
+                    "name": f"camera:{camera_index}{backend}",
+                })
+        finally:
+            if cap is not None:
+                cap.release()
+
+    return devices
+
+
 def _build_camera_unavailable_message(camera_index, errors):
     prefix = f"camera:{camera_index} 不可用。"
     if _is_wsl():
@@ -196,6 +224,8 @@ class CameraPanel(QWidget):
         lay.addWidget(self.label)
 
         self.thread = None
+        self.current_camera_index = int(camera_index)
+        self.source_kind = "local"
         self.no_camera_timer = QTimer(self)
         self.no_camera_timer.setInterval(8000)  # 每8秒重试并提示一次
         self.no_camera_timer.timeout.connect(self.try_reconnect)
@@ -213,15 +243,60 @@ class CameraPanel(QWidget):
         self.status_label = status_label
         self.info_label = info_label
 
-    def start_camera(self):
+    def selected_camera_id(self):
+        return self.current_camera_index
+
+    def selected_device_info(self):
+        if self.source_kind == "mobile":
+            return "mobile-browser"
+        return f"camera:{self.current_camera_index}"
+
+    def start_camera(self, camera_index=None):
         if self.thread and self.thread.isRunning():
             return
+        if camera_index is not None:
+            self.current_camera_index = int(camera_index)
         self.source_kind = "local"
+        self.last_frame = None
         self.label.setText(f"正在连接 camera:{self.current_camera_index} ...")
         self.thread = CameraThread(camera_index=self.current_camera_index)
         self.thread.frame_ready.connect(self.update_frame)
         self.thread.camera_lost.connect(self.on_camera_lost)
         self.thread.start()
+
+    def stop_camera(self):
+        if self.no_camera_timer.isActive():
+            self.no_camera_timer.stop()
+        if self.thread is not None:
+            try:
+                self.thread.stop()
+            finally:
+                self.thread = None
+
+    def switch_camera(self, camera_index):
+        self.stop_camera()
+        self.current_camera_index = int(camera_index)
+        self.start_camera(self.current_camera_index)
+
+    def use_mobile_source(self):
+        self.stop_camera()
+        self.source_kind = "mobile"
+        self.last_frame = None
+        self.label.setText("等待手机浏览器画面...")
+        if self.status_label is not None:
+            self.status_label.setText("状态: 等待手机扫码")
+        if self.info_label is not None:
+            self.info_label.setText("设备: mobile-browser")
+
+    def update_mobile_frame(self, frame_bgr):
+        self.source_kind = "mobile"
+        self.last_frame = frame_bgr
+        self.frame_captured.emit(frame_bgr)
+        if self.status_label is not None:
+            self.status_label.setText("状态: 手机已连接")
+        if self.info_label is not None:
+            self.info_label.setText("设备: mobile-browser")
+        self._render_frame(frame_bgr)
 
     def on_camera_lost(self, msg, detail):
         now = time.time()
@@ -248,6 +323,8 @@ class CameraPanel(QWidget):
         if cv2 is None:
             self.label.setText("OpenCV 不可用，无法渲染视频")
             return
+        if self.source_kind != "local":
+            return
 
         if self.no_camera_timer.isActive():
             self.no_camera_timer.stop()
@@ -258,9 +335,15 @@ class CameraPanel(QWidget):
             self.status_label.setText("状态: 已连接")
         if self.info_label is not None and self.thread is not None:
             backend = self.thread.backend_name or "-"
-            self.info_label.setText(f"设备: camera:0  后端: {backend}")
+            self.info_label.setText(f"设备: camera:{self.current_camera_index}  后端: {backend}")
 
-        rgb = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2RGB)
+        self._render_frame(frame_bgr)
+
+    def _render_frame(self, frame_bgr):
+        if cv2 is None:
+            self.label.setText("OpenCV 不可用，无法渲染视频")
+            return
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
@@ -319,7 +402,7 @@ class CameraPanel(QWidget):
                 "timestamp": now_str,
             }
 
-        cap, backend_name, errors = _open_video_capture(camera_id)
+        cap, backend_name, errors = _open_video_capture(target_camera_id)
         if not cap.isOpened():
             return {
                 "code": 5001,
@@ -371,4 +454,3 @@ class CameraPanel(QWidget):
     def closeEvent(self, event):
         self.stop_camera()
         super().closeEvent(event)
-
